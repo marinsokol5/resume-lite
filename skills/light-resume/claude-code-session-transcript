@@ -26,10 +26,13 @@ import glob
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
-OUT_ROOT = Path("/tmp/claude-code-session-transcript")
+# Default under the OS temp dir (honors $TMPDIR) so it's writable even under
+# Claude Code's Bash sandbox, which blocks arbitrary /tmp paths.
+OUT_ROOT = Path(tempfile.gettempdir()) / "claude-code-session-transcript"
 
 # Text blocks that are harness plumbing, not real conversation.
 _SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")

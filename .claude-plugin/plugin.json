@@ -1,7 +1,6 @@
 {
   "name": "light-resume",
   "description": "Resume a previous Claude Code session from a fast, zero-token light transcript (human <-> assistant text only, no LLM summarization).",
-  "version": "0.1.0",
   "author": {
     "name": "Marin Sokol"
   }

@@ -15,11 +15,14 @@ of which tools ran); you then read that file and carry on.
 1. **Resolve the session id** from the user's args (`$ARGUMENTS`). If they gave
    an id, use it. If they said nothing / "last" / "latest", pass `last`.
 
-2. **Run the bundled parser.** It lives next to this SKILL.md. Prefer the
-   plugin-root env var; fall back to the skill directory if it's unset:
+2. **Run the bundled parser.** `CLAUDE_PLUGIN_ROOT` is *not* reliably set in the
+   skill's shell, so locate the script robustly — use the env var if present,
+   otherwise find the installed copy in the plugin cache:
 
    ```bash
-   "${CLAUDE_PLUGIN_ROOT:?}/skills/light-resume/claude-code-session-transcript" "<sessionId-or-last>"
+   SCRIPT="${CLAUDE_PLUGIN_ROOT:+$CLAUDE_PLUGIN_ROOT/skills/light-resume/claude-code-session-transcript}"
+   [ -x "$SCRIPT" ] || SCRIPT="$(find ~/.claude/plugins -path '*light-resume*/claude-code-session-transcript' 2>/dev/null | sort | tail -1)"
+   "$SCRIPT" "<sessionId-or-last>"
    ```
 
    It prints the output file path as its last stdout line, e.g.

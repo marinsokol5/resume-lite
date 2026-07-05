@@ -15,7 +15,7 @@ It's the cheap alternative to `/summarize` for the common case: you open a fresh
 ```
 
 The `light-resume` skill runs a bundled parser that writes
-`/tmp/claude-code-session-transcript/<sessionId>/summary.md`, reads it back, and
+`$TMPDIR/claude-code-session-transcript/<sessionId>/summary.md`, reads it back, and
 gives you a short orientation before waiting for direction.
 
 Session ids are the `.jsonl` filenames under `~/.claude/projects/<encoded-cwd>/`.
