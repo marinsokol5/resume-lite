@@ -1,0 +1,16 @@
+{
+  "name": "claude-session-tools",
+  "owner": {
+    "name": "Marin Sokol"
+  },
+  "metadata": {
+    "description": "Lightweight tools for reviving and reusing past Claude Code sessions."
+  },
+  "plugins": [
+    {
+      "name": "light-resume",
+      "source": "./",
+      "description": "Resume a previous Claude Code session from a fast, zero-token light transcript (human <-> assistant text only, no LLM summarization)."
+    }
+  ]
+}

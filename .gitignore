@@ -1,0 +1,20 @@
+# Claude Code local settings (machine-specific)
+.claude/settings.local.json
+.claude/.cc-writes/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store
+
+# Editor cruft
+*.swp
+.idea/
+.vscode/
+
+# Transcript output (generated at runtime, never committed)
+/tmp/claude-code-session-transcript/

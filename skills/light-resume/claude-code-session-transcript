@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""
+claude-code-session-transcript
+
+Parse a Claude Code session JSONL and emit a *light* markdown transcript:
+just the human <-> assistant back-and-forth, with a compact note of which
+tools ran. No LLM, no tokens, ~instant.
+
+Usage:
+    claude-code-session-transcript <sessionId | path.jsonl | last>
+        [--project <cwd-or-encoded-dir>]
+        [--out <file>]           # override output path
+        [--tools | --no-tools]   # show/hide the compact tool trace (default: show)
+        [--stdout]               # also print the transcript to stdout
+
+Default output:
+    /tmp/claude-code-session-transcript/<sessionId>/summary.md
+
+On success the output file path is printed to stdout (last line).
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import sys
+from pathlib import Path
+
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+OUT_ROOT = Path("/tmp/claude-code-session-transcript")
+
+# Text blocks that are harness plumbing, not real conversation.
+_SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")
+_CAVEAT = "Caveat: The messages below were generated"
+
+
+def encode_cwd(path: str) -> str:
+    """Mirror Claude Code's project-dir encoding: non-alnum -> '-'."""
+    return "".join(c if c.isalnum() else "-" for c in path)
+
+
+def resolve_session_file(session: str, project: str | None) -> tuple[Path, str]:
+    """Return (jsonl_path, session_id)."""
+    # 1) explicit path to a .jsonl
+    p = Path(session).expanduser()
+    if p.suffix == ".jsonl" and p.is_file():
+        return p, p.stem
+
+    # Candidate project dirs to search.
+    if project:
+        proj = Path(project).expanduser()
+        if proj.is_dir() and proj.parent == PROJECTS_DIR:
+            search_dirs = [proj]                       # already an encoded dir
+        else:
+            search_dirs = [PROJECTS_DIR / encode_cwd(str(proj))]
+    else:
+        cwd_dir = PROJECTS_DIR / encode_cwd(os.getcwd())
+        search_dirs = [cwd_dir] if cwd_dir.is_dir() else []
+
+    # 2) "last" / "latest": most recent .jsonl (project-scoped, else global)
+    if session in ("last", "latest"):
+        pool = search_dirs or [PROJECTS_DIR]
+        candidates = [Path(f) for d in pool for f in glob.glob(str(d / "**/*.jsonl"), recursive=True)]
+        if not candidates:
+            sys.exit("no session .jsonl files found")
+        newest = max(candidates, key=lambda f: f.stat().st_mtime)
+        return newest, newest.stem
+
+    # 3) a bare session id -> look in project dir, then anywhere
+    sid = session[:-6] if session.endswith(".jsonl") else session
+    hits = []
+    for d in search_dirs:
+        hits += glob.glob(str(d / f"{sid}.jsonl"))
+    if not hits:
+        hits = glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
+    if not hits:
+        sys.exit(f"session '{sid}' not found under {PROJECTS_DIR}")
+    return Path(hits[0]), sid
+
+
+def load_records(path: Path) -> list[dict]:
+    out = []
+    for line in path.open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return out
+
+
+def user_text(msg: dict) -> str | None:
+    """Real user prompt text, or None if this is a tool-result carrier / plumbing."""
+    content = msg.get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        if not parts:  # list with only tool_result / images -> not a prompt
+            return None
+        text = "\n".join(parts)
+    else:
+        return None
+    text = text.strip()
+    if not text or text.startswith(_SKIP_PREFIXES) or text.startswith(_CAVEAT):
+        return None
+    return text
+
+
+def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
+    """Return (text_blocks, tool_names) from an assistant message."""
+    texts, tools = [], []
+    content = msg.get("content")
+    if isinstance(content, str):
+        if content.strip():
+            texts.append(content.strip())
+    elif isinstance(content, list):
+        for b in content:
+            if not isinstance(b, dict):
+                continue
+            t = b.get("type")
+            if t == "text" and b.get("text", "").strip():
+                texts.append(b["text"].strip())
+            elif t == "tool_use":
+                tools.append(b.get("name", "tool"))
+    return texts, tools
+
+
+def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> str:
+    cwd = next((r.get("cwd") for r in records if r.get("cwd")), "")
+    timestamps = [r.get("timestamp") for r in records if r.get("timestamp")]
+    span = f"{timestamps[0]} → {timestamps[-1]}" if timestamps else ""
+
+    # Turns: list of ("user"|"assistant", text) plus pending tool names.
+    lines: list[str] = []
+    exchanges = 0
+    pending_tools: list[str] = []
+
+    def flush_tools():
+        if show_tools and pending_tools:
+            uniq = ", ".join(dict.fromkeys(pending_tools))
+            lines.append(f"_🔧 tools: {uniq}_\n")
+        pending_tools.clear()
+
+    for r in records:
+        if r.get("isSidechain"):
+            continue
+        typ = r.get("type")
+        msg = r.get("message")
+        if not isinstance(msg, dict):
+            continue
+
+        if typ == "user":
+            txt = user_text(msg)
+            if txt is None:
+                continue
+            flush_tools()
+            exchanges += 1
+            lines.append(f"## 👤 User\n\n{txt}\n")
+        elif typ == "assistant":
+            texts, tools = assistant_parts(msg)
+            pending_tools += tools
+            for t in texts:
+                flush_tools()
+                lines.append(f"## 🤖 Claude\n\n{t}\n")
+    flush_tools()
+
+    header = [
+        f"# Session transcript — `{session_id}`",
+        "",
+        f"_Project: `{cwd}` · {exchanges} user turns · {span}_",
+        "",
+        "> Light transcript (human ↔ assistant text only; tool I/O and thinking "
+        "omitted). Read it to recover where we left off, then continue the work.",
+        "",
+        "---",
+        "",
+    ]
+    return "\n".join(header) + "\n".join(lines)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("session", help="session id, path to .jsonl, or 'last'")
+    ap.add_argument("--project", help="project cwd or encoded project dir to search")
+    ap.add_argument("--out", help="output file path")
+    ap.add_argument("--tools", dest="tools", action="store_true", default=True)
+    ap.add_argument("--no-tools", dest="tools", action="store_false")
+    ap.add_argument("--stdout", action="store_true", help="also print transcript")
+    args = ap.parse_args()
+
+    path, session_id = resolve_session_file(args.session, args.project)
+    records = load_records(path)
+    transcript = build_transcript(records, session_id, args.tools)
+
+    out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(transcript, encoding="utf-8")
+
+    if args.stdout:
+        print(transcript)
+        print("\n---", file=sys.stderr)
+    # Machine-readable last line: the path the skill should read.
+    print(out)
+
+
+if __name__ == "__main__":
+    main()
