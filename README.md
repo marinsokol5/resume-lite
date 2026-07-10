@@ -1,8 +1,9 @@
 # light-resume
 
 Resume a previous Claude Code session from a **fast, zero-token "light" transcript** —
-just the human ↔ assistant back-and-forth (plus a compact note of which tools ran),
-parsed straight from the session's saved JSONL. No LLM pass, no tokens, ~instant.
+just the human ↔ assistant back-and-forth (plus a compact note of which tools ran,
+and their targets), parsed straight from the session's saved JSONL. No LLM pass,
+no tokens, ~instant.
 
 It's the cheap alternative to `/summarize` for the common case: you open a fresh
 `claude` and just want to remember where you left off and keep going.
@@ -20,21 +21,29 @@ gives you a short orientation before waiting for direction.
 
 Session ids are the `.jsonl` filenames under `~/.claude/projects/<encoded-cwd>/`.
 
-## Install (Claude Code plugin)
+## Install
 
+It's a plain [Agent Skill](https://code.claude.com/docs/en/skills) — no plugin,
+no marketplace. Pick either:
+
+**A. Skills CLI**
 ```shell
-/plugin marketplace add marinsokol/claude-session-summarize
-/plugin install light-resume@claude-session-tools
+npx skills add marinsokol5/light-resume
 ```
 
-To develop/use it from a local clone instead of GitHub:
-
+**B. Copy it yourself** (works globally once in your user skills dir)
 ```shell
-/plugin marketplace add /path/to/claude-session-summarize
-/plugin install light-resume@claude-session-tools
+git clone https://github.com/marinsokol5/light-resume
+cp -R light-resume/skills/light-resume ~/.claude/skills/light-resume
 ```
 
-Requires Python 3 (macOS ships it; no third-party dependencies).
+**C. Symlink for local development** (edits in the repo go live immediately)
+```shell
+ln -s "$PWD/skills/light-resume" ~/.claude/skills/light-resume
+```
+
+Then start a new session and run `/light-resume`. Requires Python 3 (macOS ships
+it; no third-party dependencies).
 
 ## The parser (standalone)
 
@@ -53,14 +62,16 @@ claude "$(skills/light-resume/claude-code-session-transcript last --stdout --out
 
 ## What it keeps / drops
 
-**Keeps:** real user prompts, assistant text replies, a one-line `🔧 tools:` trace per turn.
-**Drops:** assistant thinking, tool inputs/outputs, subagent (sidechain) chatter, harness plumbing.
+**Keeps:** real user prompts, assistant text replies, and a one-line `🔧 tools:`
+trace per turn that names each tool **and its target** — files read/edited, URLs
+fetched, search patterns, etc. (`--no-tools` drops the trace for a convo-only view).
+**Drops:** assistant thinking, tool *outputs*, subagent (sidechain) chatter, harness plumbing.
 
 It's a memory jog, not a full replay. For exact prior tool results, read the raw
 JSONL under `~/.claude/projects/`.
 
-## Why not `npx skills add`?
+## Claude Code only
 
-This only understands Claude Code's own `~/.claude` session format, so the
-cross-agent Agent Skills standard buys nothing here — it ships as a Claude Code
-plugin only.
+This understands Claude Code's own `~/.claude` session format, so it's inherently
+Claude-Code-specific — the cross-agent portability of the Agent Skills standard
+doesn't apply, but the skill format still gives you a clean one-line install.

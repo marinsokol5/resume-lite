@@ -4,13 +4,19 @@ claude-code-session-transcript
 
 Parse a Claude Code session JSONL and emit a *light* markdown transcript:
 just the human <-> assistant back-and-forth, with a compact note of which
-tools ran. No LLM, no tokens, ~instant.
+tools ran and what they touched (files read/edited, URLs fetched, ...).
+No LLM, no tokens, ~instant.
+
+Two modes:
+    convo+tools (default) — user <-> assistant text + a `🔧 tools:` trace
+                            that names each tool and its target.
+    convo-only (--no-tools) — just the human <-> assistant text.
 
 Usage:
     claude-code-session-transcript <sessionId | path.jsonl | last>
         [--project <cwd-or-encoded-dir>]
         [--out <file>]           # override output path
-        [--tools | --no-tools]   # show/hide the compact tool trace (default: show)
+        [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
 
 Default output:
@@ -115,8 +121,48 @@ def user_text(msg: dict) -> str | None:
     return text
 
 
+def _short(s: str, n: int = 48) -> str:
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def tool_label(name: str, inp: dict | None) -> str:
+    """Compact `Tool(target)` label — names what the call touched, not its output."""
+    inp = inp or {}
+
+    def g(*keys):
+        for k in keys:
+            v = inp.get(k)
+            if v:
+                return v
+        return None
+
+    if name in ("Read", "Edit", "Write", "NotebookEdit"):
+        fp = g("file_path", "notebook_path")
+        return f"{name}({_short(os.path.basename(str(fp).rstrip('/')) or fp)})" if fp else name
+    if name == "Bash":
+        d = g("description")
+        return f"Bash({_short(d)})" if d else name
+    if name == "WebFetch":
+        u = g("url")
+        return f"WebFetch({_short(str(u).split('://', 1)[-1])})" if u else name
+    if name == "WebSearch":
+        q = g("query")
+        return f"WebSearch({_short(q)})" if q else name
+    if name in ("Grep", "Glob"):
+        p = g("pattern")
+        return f"{name}({_short(p)})" if p else name
+    if name in ("Task", "Agent"):
+        s = g("subagent_type", "description")
+        return f"Task({_short(s)})" if s else name
+    if name == "Skill":
+        s = g("skill")
+        return f"Skill({_short(s)})" if s else name
+    return name
+
+
 def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
-    """Return (text_blocks, tool_names) from an assistant message."""
+    """Return (text_blocks, tool_labels) from an assistant message."""
     texts, tools = [], []
     content = msg.get("content")
     if isinstance(content, str):
@@ -130,7 +176,7 @@ def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
             if t == "text" and b.get("text", "").strip():
                 texts.append(b["text"].strip())
             elif t == "tool_use":
-                tools.append(b.get("name", "tool"))
+                tools.append(tool_label(b.get("name", "tool"), b.get("input")))
     return texts, tools
 
 
@@ -178,8 +224,9 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> 
         "",
         f"_Project: `{cwd}` · {exchanges} user turns · {span}_",
         "",
-        "> Light transcript (human ↔ assistant text only; tool I/O and thinking "
-        "omitted). Read it to recover where we left off, then continue the work.",
+        "> Light transcript (human ↔ assistant text; each tool call noted with its "
+        "target — tool *outputs* and thinking omitted). Read it to recover where we "
+        "left off, then continue the work.",
         "",
         "---",
         "",
