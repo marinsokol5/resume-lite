@@ -1,9 +1,9 @@
 ---
-name: light-resume
-description: Resume a previous Claude Code or Codex session from a fast, zero-token "light" transcript (human ↔ assistant text plus compact tool traces, no LLM summarization). Use when the user runs /light-resume or $light-resume, wants to continue or inspect a past agent session, or says "resume session SESSION_ID", "load where we left off", or "light summary of session". Takes an optional session id; with none, it lists this project's Claude and Codex sessions to choose from.
+name: resume-lite
+description: Resume a previous Claude Code or Codex session from a fast, zero-token "light" transcript (human ↔ assistant text plus compact tool traces, no LLM summarization). Use when the user runs /resume-lite or $resume-lite, wants to continue or inspect a past agent session, or says "resume session SESSION_ID", "load where we left off", or "light summary of session". Takes an optional session id; with none, it lists this project's Claude and Codex sessions to choose from.
 ---
 
-# light-resume
+# resume-lite
 
 Reconstruct enough context to continue a previous session **without** an LLM
 summary or compaction pass. A bundled script parses Claude Code or Codex JSONL,
@@ -18,7 +18,7 @@ read the deterministic result.
    ```bash
    SCRIPT="$(find -L "${CODEX_HOME:-$HOME/.codex}/skills" \
         "$PWD/.codex/skills" ~/.claude/skills "$PWD/.claude/skills" \
-        -path '*/light-resume/session-transcript' 2>/dev/null | sort | tail -1)"
+        -path '*/resume-lite/session-transcript' 2>/dev/null | sort | tail -1)"
    ```
 
 2. **Pick the session.**

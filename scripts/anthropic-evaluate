@@ -5,7 +5,7 @@ anthropic-evaluate
 Measure how many *input tokens* one or more artifacts cost, using Anthropic's
 token-counting endpoint (`POST /v1/messages/count_tokens`) — the ground-truth
 count for a given model, free and unbilled. Built to compare session-handoff
-artifacts (light-resume `summary.md`, `--no-tools` variant, `/export` .txt, the
+artifacts (resume-lite `summary.md`, `--no-tools` variant, `/export` .txt, the
 raw session `.jsonl`) so you can see the real token cost of each.
 
 Works with both Claude Code and Codex sessions; the storage location a session
@@ -14,7 +14,7 @@ id resolves to selects the provider automatically.
 Each positional arg is either a **file path** or a bare **session id**; mix them
 freely. Per-arg handling:
     session id -> expands to the full comparison in one shot: the raw .jsonl
-                  (the `--resume` baseline), light-resume rendered in both
+                  (the `--resume` baseline), resume-lite rendered in both
                   `--tools` and `--no-tools` modes (via the sibling
                   session-transcript script), and — if scripts/exports/<id>.md
                   exists — the `/export` dump. Claude sessions are found in the
@@ -164,7 +164,7 @@ def render_transcript(sid: str, mode: str) -> Path | None:
 
 def items_for_arg(arg: str) -> list[tuple[str, str | None, list[dict] | None]]:
     """(label, kind, messages) rows for one arg. A session id expands to three rows:
-    raw .jsonl (the --resume baseline) + light-resume in +tools and --no-tools modes."""
+    raw .jsonl (the --resume baseline) + resume-lite in +tools and --no-tools modes."""
     p = Path(arg)
     if p.is_file():  # explicit file path stays literal (one row)
         kind = "jsonl" if p.suffix == ".jsonl" else "single"

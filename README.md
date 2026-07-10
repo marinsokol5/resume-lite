@@ -1,4 +1,4 @@
-# light-resume
+# resume-lite
 
 Resume a **Claude Code or Codex** session from a
 deterministic transcript. Just the human ↔ agent
@@ -18,16 +18,16 @@ Random Claude Code session:
 | ---------------------- | ------: |
 | `--resume`             | 365,850 |
 | `/export`              |  27,165 |
-| /light-resume         |  12,350 |
-| /light-resume `--no-tools` |  11,311 |
+| /resume-lite          |  12,350 |
+| /resume-lite `--no-tools`  |  11,311 |
 
 Random Codex session:
 
 | Source                 |  Tokens |
 | ---------------------- | ------: |
 | `resume`               | 358,756 |
-| /light-resume     |   7,633 |
-| /light-resume   `--no-tools`     |   5,020 |
+| /resume-lite      |   7,633 |
+| /resume-lite   `--no-tools`      |   5,020 |
 
 
 ## Install
@@ -36,15 +36,15 @@ Plain Agent Skill — no plugin or marketplace. Needs Python 3, no dependencies.
 
 ```shell
 # Skills CLI
-npx skills add marinsokol5/light-resume
+npx skills add marinsokol5/resume-lite
 ```
 
 ## Use it
 
-As a skill (`/light-resume` in Claude Code, `light-resume` in Codex):
+As a skill (`/resume-lite` in Claude Code, `resume-lite` in Codex):
 
 ```
-/light-resume <sessionId>
+/resume-lite <sessionId>
 ```
 
 It runs the bundled `session-transcript` parser, writes the transcript to
