@@ -8,16 +8,22 @@ count for a given model, free and unbilled. Built to compare session-handoff
 artifacts (light-resume `summary.md`, `--no-tools` variant, `/export` .txt, the
 raw session `.jsonl`) so you can see the real token cost of each.
 
-Per-file handling:
-    *.jsonl  -> reconstruct the conversation and count it as a full messages=[]
-               request (the honest proxy for what `--resume` re-ingests): every
-               user/assistant record, flattened to text, consecutive same-role
-               records merged so roles alternate.
-    anything -> counted as a single user message containing the whole file
-    else       (summary.md, export .txt, ...).
+Each positional arg is either a **file path** or a bare **session id**; mix them
+freely. Per-arg handling:
+    session id -> expands to THREE rows for a one-shot comparison: the raw
+                  .jsonl (the `--resume` baseline) plus light-resume rendered in
+                  both `--tools` and `--no-tools` modes (via the sibling
+                  session-transcript script). The session is found in the current
+                  project, or anywhere under ~/.claude/projects.
+    *.jsonl    -> reconstruct the conversation and count it as a full messages=[]
+                  request (the honest proxy for what `--resume` re-ingests):
+                  every user/assistant record, flattened to text, consecutive
+                  same-role records merged so roles alternate.
+    other file -> counted as a single user message containing the whole file
+                  (summary.md, export .txt, a /compact summary, ...).
 
 Usage:
-    scripts/anthropic-evaluate FILE [FILE ...]
+    scripts/anthropic-evaluate <session-id | file> [...]
         [--model <id>]   # default claude-opus-4-8
         [--dry-run]      # don't call the API; print message/char counts only
         [--json]         # emit machine-readable JSON instead of a table
@@ -34,9 +40,12 @@ system prompt or tools, so numbers reflect the artifact's content only.
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
+import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -45,6 +54,58 @@ DEFAULT_MODEL = "claude-opus-4-8"
 BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
 ENDPOINT = "/v1/messages/count_tokens"
 API_VERSION = "2023-06-01"
+PROJECTS_DIR = Path.home() / ".claude" / "projects"
+# Sibling script (repo root) that renders a session .jsonl into a light transcript.
+TRANSCRIPT = Path(__file__).resolve().parent.parent / "session-transcript"
+
+
+# ---- resolve an arg into the artifacts to size --------------------------
+
+def _project_dir() -> Path:
+    """The current directory's Claude Code project storage dir (id-encoded cwd)."""
+    encoded = "".join(c if c.isalnum() else "-" for c in os.getcwd())
+    return PROJECTS_DIR / encoded
+
+
+def find_session_jsonl(sid: str) -> Path | None:
+    """Locate a session id's .jsonl: this project first, then anywhere. None if missing."""
+    sid = sid[:-6] if sid.endswith(".jsonl") else sid
+    hits = glob.glob(str(_project_dir() / f"{sid}.jsonl"))
+    if not hits:
+        hits = glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
+    return Path(hits[0]) if hits else None
+
+
+def render_transcript(sid: str, mode: str) -> Path | None:
+    """Run the sibling session-transcript for `mode` (--tools/--no-tools). Path or None."""
+    out = Path(tempfile.gettempdir()) / "anthropic-evaluate" / f"{sid}{mode}.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    r = subprocess.run([sys.executable, str(TRANSCRIPT), sid, mode, "--out", str(out)],
+                       capture_output=True, text=True)
+    return out if r.returncode == 0 and out.is_file() else None
+
+
+def items_for_arg(arg: str) -> list[tuple[str, str | None, list[dict] | None]]:
+    """(label, kind, messages) rows for one arg. A session id expands to three rows:
+    raw .jsonl (the --resume baseline) + light-resume in +tools and --no-tools modes."""
+    p = Path(arg)
+    if p.is_file():  # explicit file path stays literal (one row)
+        kind = "jsonl" if p.suffix == ".jsonl" else "single"
+        return [(p.name, kind, build_messages(p))]
+
+    jsonl = find_session_jsonl(arg)
+    if jsonl is None:
+        return [(arg, None, None)]  # unresolvable -> error row
+    sid, short = jsonl.stem, jsonl.stem[:8]
+    rows: list[tuple[str, str | None, list[dict] | None]] = [
+        (f"{short} --resume (.jsonl)", "jsonl", jsonl_messages(jsonl)),
+    ]
+    for mode in ("--tools", "--no-tools"):
+        md = render_transcript(sid, mode)
+        label = f"{short} light {mode}"
+        rows.append((label, "single", build_messages(md)) if md
+                    else (label, None, None))
+    return rows
 
 
 # ---- .jsonl -> messages reconstruction ----------------------------------
@@ -152,7 +213,8 @@ def count_tokens(messages: list[dict], model: str, headers: dict[str, str]) -> i
 
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("files", nargs="+", help="artifacts to size (.jsonl or text)")
+    ap.add_argument("files", nargs="+", metavar="ARG",
+                    help="session id or file path (mix freely)")
     ap.add_argument("--model", default=DEFAULT_MODEL, help=f"default {DEFAULT_MODEL}")
     ap.add_argument("--dry-run", action="store_true",
                     help="skip the API; show message/char counts only")
@@ -162,19 +224,17 @@ def main() -> None:
     headers = None if args.dry_run else auth_headers()
     rows = []
     for f in args.files:
-        path = Path(f)
-        if not path.is_file():
-            rows.append({"file": f, "error": "not found"})
-            continue
-        msgs = build_messages(path)
-        kind = "jsonl" if path.suffix == ".jsonl" else "single"
-        chars = sum(len(m["content"]) for m in msgs)
-        row = {"file": path.name, "kind": kind, "messages": len(msgs), "chars": chars}
-        if not msgs:
-            row["error"] = "no messages"
-        elif not args.dry_run:
-            row["tokens"] = count_tokens(msgs, args.model, headers)
-        rows.append(row)
+        for label, kind, msgs in items_for_arg(f):
+            if kind is None:
+                rows.append({"file": label, "error": "no such file or session id"})
+                continue
+            chars = sum(len(m["content"]) for m in msgs)
+            row = {"file": label, "kind": kind, "messages": len(msgs), "chars": chars}
+            if not msgs:
+                row["error"] = "no messages"
+            elif not args.dry_run:
+                row["tokens"] = count_tokens(msgs, args.model, headers)
+            rows.append(row)
 
     toks = [r["tokens"] for r in rows if "tokens" in r]
     lo = min(toks) if toks else 0
@@ -185,7 +245,7 @@ def main() -> None:
     # Table
     w = max((len(r["file"]) for r in rows), default=4)
     if args.dry_run:
-        print(f"{'FILE':<{w}}  {'KIND':<6} {'MSGS':>5} {'CHARS':>9} {'~TOK':>8}")
+        print(f"{'SOURCE':<{w}}  {'KIND':<6} {'MSGS':>5} {'CHARS':>9} {'~TOK':>8}")
         for r in rows:
             if "error" in r:
                 print(f"{r['file']:<{w}}  {r['error']}")
@@ -195,7 +255,7 @@ def main() -> None:
         print("\n(--dry-run: ~TOK is chars/4, a rough estimate; drop --dry-run for exact counts)")
         return
 
-    print(f"{'FILE':<{w}}  {'KIND':<6} {'MSGS':>5} {'TOKENS':>9} {'×MIN':>6}")
+    print(f"{'SOURCE':<{w}}  {'KIND':<6} {'MSGS':>5} {'TOKENS':>9} {'×MIN':>6}")
     for r in rows:
         if "error" in r:
             print(f"{r['file']:<{w}}  {r['error']}")
