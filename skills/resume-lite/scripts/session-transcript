@@ -894,13 +894,37 @@ def print_session_list() -> None:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(add_help=True)
+    ap = argparse.ArgumentParser(
+        add_help=True,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Emit a light Markdown transcript of a Claude Code or Codex "
+            "session:\nthe human <-> assistant text plus a compact trace of "
+            "which tools ran\nand what they touched. No LLM, no tokens, "
+            "~instant."),
+        epilog=(
+            "modes:\n"
+            "  session-transcript                 list this project's "
+            "sessions, then exit\n"
+            "  session-transcript <sessionId>     write that session's "
+            "transcript\n\n"
+            "Sessions are scoped to the current directory. Lookup by id "
+            "searches the\nClaude Code and Codex stores; the matching store "
+            "selects the provider.\n\n"
+            "With an id, the transcript's file path is printed as the LAST "
+            "stdout line\n(read that file). Default location:\n"
+            "  $TMPDIR/session-transcript/<sessionId>/summary.md"),
+    )
     ap.add_argument("session", nargs="?",
                     help="session id; omit to list this project's sessions")
-    ap.add_argument("--out", help="output file path")
-    ap.add_argument("--tools", dest="tools", action="store_true", default=True)
-    ap.add_argument("--no-tools", dest="tools", action="store_false")
-    ap.add_argument("--stdout", action="store_true", help="also print transcript")
+    ap.add_argument("--out", metavar="FILE",
+                    help="write the transcript here instead of the default path")
+    ap.add_argument("--tools", dest="tools", action="store_true", default=True,
+                    help="include the 🔧 tools trace (default)")
+    ap.add_argument("--no-tools", dest="tools", action="store_false",
+                    help="omit the tools trace (conversation only)")
+    ap.add_argument("--stdout", action="store_true",
+                    help="also print the transcript to stdout")
     args = ap.parse_args()
 
     if not args.session:

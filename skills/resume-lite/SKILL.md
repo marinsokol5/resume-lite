@@ -5,52 +5,21 @@ description: Resume a previous Claude Code or Codex session from a fast, zero-to
 
 # resume-lite
 
-Reconstruct enough context to continue a previous session **without** an LLM
-summary or compaction pass. A bundled script parses Claude Code or Codex JSONL,
-writes user ↔ assistant text plus compact tool traces to Markdown, and lets you
-read the deterministic result.
+Continue a past session **without** an LLM summary. The bundled deterministic
+script `scripts/session-transcript` (beside this file, run with `python3`) does
+the parsing; see its `--help` for modes and flags.
 
 ## Steps
 
-1. **Locate the bundled parser.** The script ships in `scripts/` beside this
-   `SKILL.md`, but the skill's install root varies, so find it in the standard
-   Codex, Claude, and universal (`.agents`) skill roots:
+1. **No session id?** Run `python3 scripts/session-transcript` to list this
+   project's sessions, show them to the user, and ask which to resume — don't
+   guess.
 
-   ```bash
-   SCRIPT="$(find -L "${CODEX_HOME:-$HOME/.codex}/skills" \
-        "$PWD/.codex/skills" ~/.claude/skills "$PWD/.claude/skills" \
-        ~/.agents/skills "$PWD/.agents/skills" \
-        -path '*/resume-lite/scripts/session-transcript' 2>/dev/null | sort | tail -1)"
-   ```
+2. **With an id** (from `$ARGUMENTS` or the user's choice) run
+   `python3 scripts/session-transcript "<id>"`. It writes the transcript and
+   prints its file path as the **last stdout line**. On a missing/ambiguous id
+   it exits non-zero with the reason — relay that and ask the user to confirm.
 
-2. **Pick the session.**
-   - If the user gave a session id in their args (`$ARGUMENTS`), use it.
-   - If they gave **nothing**, run `python3 "$SCRIPT"` with no argument to print
-     the list of this project's sessions (`provider · id · time · first prompt`),
-     show it to the user, and ask which to resume. Don't guess; wait for an id.
-
-3. **Run the parser with the chosen id:** `python3 "$SCRIPT" "<sessionId>"`. It prints the
-   output file path as its last stdout line, e.g.
-   `$TMPDIR/session-transcript/<sessionId>/summary.md`. The matching storage
-   location automatically selects the Claude or Codex adapter.
-
-4. **Read that file** with the Read tool.
-
-5. **Give the user a 2–3 line orientation**: what the session was about, the
-   last thing that was happening, and the obvious next step — then wait for
-   direction (don't auto-run anything).
-
-## Notes
-
-- The transcript names each tool call and its target when available, but omits
-  tool *outputs* and assistant *thinking*. For exact details, inspect raw JSONL
-  under `~/.claude/projects/<encoded-cwd>/` or
-  `$CODEX_HOME/sessions/YYYY/MM/DD/` (normally `~/.codex/sessions/`).
-- For Codex, derive exact edit targets from patch headers and classify common
-  shell commands deterministically; omit unrecognized shell plumbing instead of
-  generating an LLM summary.
-- Flags: `--no-tools` drops the `🔧 tools:` trace (convo-only mode); `--stdout`
-  also prints the transcript; `--out <file>` overrides the output path.
-- Session listing is scoped to the current directory; lookup by id searches both
-  stores globally. If an id is missing or ambiguous, relay the non-zero error and
-  ask the user to confirm it.
+3. **Read that file**, then give a 2–3 line orientation: what the session was
+   about, the last thing happening, and the obvious next step. Then wait — don't
+   auto-run anything.
