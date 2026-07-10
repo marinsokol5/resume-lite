@@ -52,6 +52,12 @@ OUT_ROOT = Path(tempfile.gettempdir()) / "session-transcript"
 # Text blocks that are harness plumbing, not real conversation.
 _SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")
 _CAVEAT = "Caveat: The messages below were generated"
+# Standalone interrupt markers (matched exactly so a real prompt appended in the
+# same message is never dropped).
+_INTERRUPT_MARKERS = frozenset({
+    "[Request interrupted by user]",
+    "[Request interrupted by user for tool use]",
+})
 # Records the harness injects but that aren't conversation carry `isMeta: true`:
 # `/context` dumps, `Base directory for this skill:`, local-command caveats, and
 # "Continue from where you left off." continuations. Real prompts never do. We
@@ -146,8 +152,24 @@ def find_session_file(session: str) -> tuple[Path, str]:
     return unique[0]
 
 
+def _command_name(msg: dict) -> str | None:
+    """If a Claude user message is a slash-command invocation, return '/name'."""
+    content = msg.get("content")
+    if isinstance(content, list):
+        content = "\n".join(b.get("text", "") for b in content
+                            if isinstance(b, dict) and b.get("type") == "text")
+    if not isinstance(content, str):
+        return None
+    m = re.search(r"<command-name>\s*(/[^<\s]+)", content)
+    return m.group(1) if m else None
+
+
 def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
-    """First real user prompt in a session, for the listing. Reads only until found."""
+    """First user prompt in a session, for the listing. Reads only until found.
+
+    If the session opens with a slash command, surface its name (e.g.
+    `/resume-lite`) rather than skipping to a later typed prompt.
+    """
     try:
         for line in path.open(encoding="utf-8"):
             line = line.strip()
@@ -160,6 +182,9 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
             if provider == "claude" and r.get("type") == "user" \
                     and not r.get("isSidechain") and not r.get("isMeta") \
                     and isinstance(r.get("message"), dict):
+                cmd = _command_name(r["message"])
+                if cmd:
+                    return cmd
                 txt = user_text(r["message"])
                 if txt:
                     return _short(txt, limit)
@@ -241,7 +266,8 @@ def user_text(msg: dict) -> str | None:
     else:
         return None
     text = text.strip()
-    if not text or text.startswith(_SKIP_PREFIXES) or text.startswith(_CAVEAT):
+    if not text or text.startswith(_SKIP_PREFIXES) or text.startswith(_CAVEAT) \
+            or text in _INTERRUPT_MARKERS:
         return None
     return text
 
@@ -884,7 +910,7 @@ def print_session_list() -> None:
     if not sessions:
         print(f"No Claude Code or Codex sessions found for {cwd}")
         return
-    shown, total = sessions[:10], len(sessions)
+    shown, total = sessions[:5], len(sessions)
     label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
     print(f"Sessions in {cwd} ({label}, newest first):\n")
     for path, provider, sid in shown:  # snippet read only for displayed sessions
