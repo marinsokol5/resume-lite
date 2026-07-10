@@ -1,4 +1,4 @@
-# resume-lite
+# resume-lite Agent Skill
 
 Resume a **Claude Code or Codex** session from a
 deterministic transcript. Just the human ↔ agent
