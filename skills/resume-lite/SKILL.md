@@ -9,6 +9,10 @@ Continue a past session **without** an LLM summary. The bundled deterministic
 script `scripts/session-transcript` (beside this file, run with `python3`) does
 the parsing; see its `--help` for modes and flags.
 
+Run it by its **full path** (this skill's base directory + `scripts/session-transcript`)
+from the user's **current project directory** — don't `cd` into the skill folder,
+since it scopes sessions to the working directory.
+
 ## Steps
 
 1. **No session id?** Run `python3 scripts/session-transcript` to list this

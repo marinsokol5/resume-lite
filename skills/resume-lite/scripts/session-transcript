@@ -879,13 +879,14 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
 
 def print_session_list() -> None:
     """No session id given: list this project's sessions so one can be chosen."""
-    sessions = list_sessions()
+    cwd = os.getcwd()  # sessions are scoped to this directory; name it so a
+    sessions = list_sessions()  # wrong CWD is obvious rather than "none exist"
     if not sessions:
-        print("No Claude Code or Codex sessions found for this project.")
+        print(f"No Claude Code or Codex sessions found for {cwd}")
         return
     shown, total = sessions[:10], len(sessions)
     label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
-    print(f"Sessions in this project ({label}, newest first):\n")
+    print(f"Sessions in {cwd} ({label}, newest first):\n")
     for path, provider, sid in shown:  # snippet read only for displayed sessions
         ts = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         snippet = first_user_snippet(path, provider)

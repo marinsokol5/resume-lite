@@ -34,9 +34,12 @@ Random Codex session:
 
 Plain Agent Skill, needs Python 3.
 
-```shell
-# Skills CLI
+```bash
+# Agent Skills CLI
 npx skills add marinsokol5/resume-lite
+
+# Later you can update it via
+npx skills update resume-lite
 ```
 
 ## Use it
