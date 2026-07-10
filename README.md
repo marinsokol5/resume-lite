@@ -1,90 +1,122 @@
 # light-resume
 
-Resume a previous Claude Code or Codex session from a **fast, zero-token "light" transcript** —
-just the human ↔ assistant back-and-forth (plus a compact note of which tools ran,
-and their targets), parsed straight from the session's saved JSONL. No LLM pass,
-no tokens, ~instant.
+Resume a **Claude Code or Codex** session from a
+deterministic transcript. Just the human ↔ agent
+back-and-forth and tools invocations,
+parsed from the session's saved JSONL. No LLM pass, no tokens.
 
-It's the deterministic alternative to an LLM-generated summary or compaction for
-the common case: open a fresh agent and recover where you left off.
+Because the output is a plain Markdown transcript, it's also a **cross-provider
+handoff**: feed a Claude session to Codex, or a Codex session to Claude.
 
-## What you get
+## Why
 
-```
-/light-resume                 # list this project's Claude/Codex sessions
-/light-resume <sessionId>     # resume a specific session
-```
+It's the fast and deterministic alternative to `/compact`, made to be lighter than `--resume`.
 
-The `light-resume` skill runs a bundled parser that writes
-`$TMPDIR/session-transcript/<sessionId>/summary.md`, reads it back, and
-gives you a short orientation before waiting for direction.
+Random Claude Code session:
 
-The session id determines which store and parser to use automatically.
+| Source                 |  Tokens |
+| ---------------------- | ------: |
+| `--resume`             | 365,850 |
+| `/export`              |  27,165 |
+| /light-resume         |  12,350 |
+| /light-resume `--no-tools` |  11,311 |
+
+Random Codex session:
+
+| Source                 |  Tokens |
+| ---------------------- | ------: |
+| `resume`               | 358,756 |
+| /light-resume     |   7,633 |
+| /light-resume   `--no-tools`     |   5,020 |
+
 
 ## Install
 
-It's a plain Agent Skill—no plugin or marketplace required.
+Plain Agent Skill — no plugin or marketplace. Needs Python 3, no dependencies.
 
-**A. Skills CLI**
 ```shell
+# Skills CLI
 npx skills add marinsokol5/light-resume
 ```
 
-**B. Clone for Codex** (works globally)
-```shell
-git clone https://github.com/marinsokol5/light-resume "${CODEX_HOME:-$HOME/.codex}/skills/light-resume"
+## Use it
+
+As a skill (`/light-resume` in Claude Code, `light-resume` in Codex):
+
+```
+/light-resume <sessionId>
 ```
 
-**C. Clone for Claude Code** (works globally)
+It runs the bundled `session-transcript` parser, writes the transcript to
+`$TMPDIR/session-transcript/<sessionId>/summary.md`, reads it back, and gives a
+short orientation.
+
+Or run the parser directly:
+
 ```shell
-git clone https://github.com/marinsokol5/light-resume ~/.claude/skills/light-resume
+./session-transcript <sessionId>     # write the transcript, print its path
 ```
 
-**D. Symlink for local development** (choose the agent's skills directory)
-```shell
-ln -s "$PWD" "${CODEX_HOME:-$HOME/.codex}/skills/light-resume"
-ln -s "$PWD" ~/.claude/skills/light-resume
-```
+Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
+`--out <file>` (override the path).
 
-Then start a new session and invoke `light-resume`; Claude Code also exposes it
-as `/light-resume`. Requires Python 3 and no third-party dependencies.
-
-## The parser (standalone)
-
-You can also run the parser directly:
+Cross-provider handoff — seed either agent with a session from the other:
 
 ```shell
-./session-transcript                 # list this project's sessions
-./session-transcript <sessionId> [--out <file>] [--no-tools] [--stdout]
-
-# seed a fresh interactive session with a transcript:
 claude "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
+codex  "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
 ```
 
-- No argument → prints this project's sessions (`provider · id · time · first prompt`); pick one.
-- With a `<sessionId>` → prints the output file path as its final stdout line.
-- The list is scoped to the current directory; id lookup searches both stores.
+The session id picks the store and adapter automatically.
 
-## What it keeps / drops
+## How it works
 
-**Keeps:** real user prompts, assistant text replies, and a one-line `🔧 tools:`
-trace per turn that names each tool **and its target** — files read/edited, URLs
-fetched, search patterns, etc. (`--no-tools` drops the trace for a convo-only view).
-**Drops:** assistant thinking, tool *outputs*, subagent (sidechain) chatter, and
-harness plumbing (`isMeta` records — `/context` dumps, local-command caveats, skill
-base-dir notices, and "Continue from where you left off." continuations).
+**Keeps:** user prompts, assistant text, and a one-line `🔧 tools:` trace per
+turn naming each tool and its target (files, URLs, search patterns, commands).
 
-For Codex, patch headers provide exact `Edit`/`Write`/`Delete` targets; common
-shell commands are classified into deterministic `Read`, `Search`, `Git`, `Run`,
-and validation labels, while unrecognized shell plumbing is omitted.
+**Drops:** thinking / encrypted reasoning, tool outputs, duplicate records,
+subagent chatter, token telemetry, and harness noise (Claude `isMeta` records:
+`/context` dumps, skill notices, "Continue from where you left off." lines).
 
-It's a memory jog, not a full replay. For exact prior tool results, inspect the
-raw JSONL in either supported session store below.
+Codex specifics: patch headers give exact `Edit`/`Write`/`Delete` targets;
+common shell commands are labeled `Read`/`Search`/`Git`/`Run`; unrecognized
+plumbing is dropped.
 
-## Supported session stores
+For example, one opening turn from a Codex session. The raw `.jsonl` that
+`--resume` re-reads — duplicated user/assistant records, an encrypted reasoning
+blob, the tool-call script, and its output, every turn:
+
+```jsonl
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"ss: create a separate worktree called codex-support"}]}}
+{"type":"event_msg","payload":{"type":"user_message","message":"ss: create a separate worktree called codex-support"}}
+{"type":"response_item","payload":{"type":"reasoning","encrypted_content":"gAAAAABqUKpTCloFSqS9BhTQ9nk3n0mv...<~1 KB blob>..."}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"I’ll create a sibling worktree and branch named `codex-support` from the current `HEAD`."}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I’ll create a sibling worktree..."}]}}
+{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"...git worktree list --porcelain && git branch --list codex-support && test ! -e ../codex-support..."}}
+{"type":"response_item","payload":{"type":"custom_tool_call_output","output":[{"type":"input_text","text":"worktree /Users/.../claude-session-summarize\nHEAD a949ee3...\n"}]}}
+{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":14834,...}}}}
+```
+
+The same turn as a light transcript:
+
+```markdown
+## 👤 User
+
+ss: create a separate worktree called codex-support
+
+## 🤖 Codex
+
+I'll create a sibling worktree and branch named `codex-support` from the current `HEAD`.
+
+_🔧 tools: Git(worktree list), Git(branch codex-support), Git(worktree add codex-support)_
+
+## 🤖 Codex
+
+Created worktree `/Users/marinsokol/projects/codex-support` on branch `codex-support`.
+```
+
+It's a memory jog, not a full replay. For exact tool results, read the raw JSONL:
 
 - Claude Code: `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl`
-- Codex: `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-…-<sessionId>.jsonl`
-  (normally `~/.codex/sessions/`; archived sessions are also recognized)
-
-The formats use separate adapters and one shared Markdown renderer.
+- Codex: `~/.codex/sessions/YYYY/MM/DD/rollout-…-<sessionId>.jsonl`
+  (archived sessions are also recognized)
