@@ -10,11 +10,12 @@ raw session `.jsonl`) so you can see the real token cost of each.
 
 Each positional arg is either a **file path** or a bare **session id**; mix them
 freely. Per-arg handling:
-    session id -> expands to THREE rows for a one-shot comparison: the raw
-                  .jsonl (the `--resume` baseline) plus light-resume rendered in
-                  both `--tools` and `--no-tools` modes (via the sibling
-                  session-transcript script). The session is found in the current
-                  project, or anywhere under ~/.claude/projects.
+    session id -> expands to the full comparison in one shot: the raw .jsonl
+                  (the `--resume` baseline), light-resume rendered in both
+                  `--tools` and `--no-tools` modes (via the sibling
+                  session-transcript script), and — if scripts/exports/<id>.md
+                  exists — the `/export` dump. The session is found in the
+                  current project, or anywhere under ~/.claude/projects.
     *.jsonl    -> reconstruct the conversation and count it as a full messages=[]
                   request (the honest proxy for what `--resume` re-ingests):
                   every user/assistant record, flattened to text, consecutive
@@ -57,6 +58,8 @@ API_VERSION = "2023-06-01"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # Sibling script (repo root) that renders a session .jsonl into a light transcript.
 TRANSCRIPT = Path(__file__).resolve().parent.parent / "session-transcript"
+# Where `/export <id>.md` dumps live; a session id auto-picks up scripts/exports/<id>.md.
+EXPORTS_DIR = Path(__file__).resolve().parent / "exports"
 
 
 # ---- resolve an arg into the artifacts to size --------------------------
@@ -100,6 +103,9 @@ def items_for_arg(arg: str) -> list[tuple[str, str | None, list[dict] | None]]:
     rows: list[tuple[str, str | None, list[dict] | None]] = [
         (f"{short} --resume (.jsonl)", "jsonl", jsonl_messages(jsonl)),
     ]
+    export = EXPORTS_DIR / f"{sid}.md"  # a matching /export dump, if one exists
+    if export.is_file():
+        rows.append((f"{short} /export", "single", build_messages(export)))
     for mode in ("--tools", "--no-tools"):
         md = render_transcript(sid, mode)
         label = f"{short} light {mode}"
