@@ -31,15 +31,14 @@ no marketplace. Pick either:
 npx skills add marinsokol5/light-resume
 ```
 
-**B. Copy it yourself** (works globally once in your user skills dir)
+**B. Clone into your user skills dir** (works globally)
 ```shell
-git clone https://github.com/marinsokol5/light-resume
-cp -R light-resume/skills/light-resume ~/.claude/skills/light-resume
+git clone https://github.com/marinsokol5/light-resume ~/.claude/skills/light-resume
 ```
 
 **C. Symlink for local development** (edits in the repo go live immediately)
 ```shell
-ln -s "$PWD/skills/light-resume" ~/.claude/skills/light-resume
+ln -s "$PWD" ~/.claude/skills/light-resume
 ```
 
 Then start a new session and run `/light-resume`. Requires Python 3 (macOS ships
@@ -50,11 +49,11 @@ it; no third-party dependencies).
 You can also run the parser directly:
 
 ```shell
-skills/light-resume/session-transcript                 # list this project's sessions
-skills/light-resume/session-transcript <sessionId> [--out <file>] [--no-tools] [--stdout]
+./session-transcript                 # list this project's sessions
+./session-transcript <sessionId> [--out <file>] [--no-tools] [--stdout]
 
 # seed a fresh interactive session with a transcript:
-claude "$(skills/light-resume/session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
+claude "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
 ```
 
 - No argument → prints this project's sessions (`id · time · first prompt`); pick one.
