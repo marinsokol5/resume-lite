@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-claude-code-session-transcript
+session-transcript
 
 Parse a Claude Code session JSONL and emit a *light* markdown transcript:
 just the human <-> assistant back-and-forth, with a compact note of which
@@ -13,21 +13,25 @@ Two modes:
     convo-only (--no-tools) — just the human <-> assistant text.
 
 Usage:
-    claude-code-session-transcript <sessionId | path.jsonl | last>
-        [--project <cwd-or-encoded-dir>]
+    session-transcript                 # list this project's sessions, then exit
+    session-transcript <sessionId>     # write a transcript for that session
         [--out <file>]           # override output path
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
 
-Default output:
-    /tmp/claude-code-session-transcript/<sessionId>/summary.md
+Sessions are scoped to the current directory's Claude Code project. Pass no
+argument to list them (id · time · first prompt); re-run with a chosen id.
 
-On success the output file path is printed to stdout (last line).
+Default output:
+    $TMPDIR/session-transcript/<sessionId>/summary.md
+
+With a sessionId, the output file path is printed to stdout (last line).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import glob
 import json
 import os
@@ -38,7 +42,7 @@ from pathlib import Path
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 # Default under the OS temp dir (honors $TMPDIR) so it's writable even under
 # Claude Code's Bash sandbox, which blocks arbitrary /tmp paths.
-OUT_ROOT = Path(tempfile.gettempdir()) / "claude-code-session-transcript"
+OUT_ROOT = Path(tempfile.gettempdir()) / "session-transcript"
 
 # Text blocks that are harness plumbing, not real conversation.
 _SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")
@@ -50,43 +54,48 @@ def encode_cwd(path: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in path)
 
 
-def resolve_session_file(session: str, project: str | None) -> tuple[Path, str]:
-    """Return (jsonl_path, session_id)."""
-    # 1) explicit path to a .jsonl
-    p = Path(session).expanduser()
-    if p.suffix == ".jsonl" and p.is_file():
-        return p, p.stem
+def project_dir() -> Path:
+    """The current directory's Claude Code project storage dir."""
+    return PROJECTS_DIR / encode_cwd(os.getcwd())
 
-    # Candidate project dirs to search.
-    if project:
-        proj = Path(project).expanduser()
-        if proj.is_dir() and proj.parent == PROJECTS_DIR:
-            search_dirs = [proj]                       # already an encoded dir
-        else:
-            search_dirs = [PROJECTS_DIR / encode_cwd(str(proj))]
-    else:
-        cwd_dir = PROJECTS_DIR / encode_cwd(os.getcwd())
-        search_dirs = [cwd_dir] if cwd_dir.is_dir() else []
 
-    # 2) "last" / "latest": most recent .jsonl (project-scoped, else global)
-    if session in ("last", "latest"):
-        pool = search_dirs or [PROJECTS_DIR]
-        candidates = [Path(f) for d in pool for f in glob.glob(str(d / "**/*.jsonl"), recursive=True)]
-        if not candidates:
-            sys.exit("no session .jsonl files found")
-        newest = max(candidates, key=lambda f: f.stat().st_mtime)
-        return newest, newest.stem
-
-    # 3) a bare session id -> look in project dir, then anywhere
+def find_session_file(session: str) -> Path:
+    """Locate a session by id: this project first, then anywhere. Exit if missing."""
     sid = session[:-6] if session.endswith(".jsonl") else session
-    hits = []
-    for d in search_dirs:
-        hits += glob.glob(str(d / f"{sid}.jsonl"))
+    hits = glob.glob(str(project_dir() / f"{sid}.jsonl"))
     if not hits:
         hits = glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
     if not hits:
         sys.exit(f"session '{sid}' not found under {PROJECTS_DIR}")
-    return Path(hits[0]), sid
+    return Path(hits[0])
+
+
+def first_user_snippet(path: Path, limit: int = 72) -> str:
+    """First real user prompt in a session, for the listing. Reads only until found."""
+    try:
+        for line in path.open(encoding="utf-8"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if r.get("type") == "user" and not r.get("isSidechain") \
+                    and isinstance(r.get("message"), dict):
+                txt = user_text(r["message"])
+                if txt:
+                    return _short(txt, limit)
+    except OSError:
+        pass
+    return ""
+
+
+def list_sessions() -> list[Path]:
+    """This project's session .jsonl files, newest first."""
+    files = [Path(f) for f in glob.glob(str(project_dir() / "*.jsonl"))]
+    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
+    return files
 
 
 def load_records(path: Path) -> list[dict]:
@@ -234,17 +243,38 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> 
     return "\n".join(header) + "\n".join(lines)
 
 
+def print_session_list() -> None:
+    """No session id given: list this project's sessions so one can be chosen."""
+    files = list_sessions()
+    if not files:
+        print(f"No Claude Code sessions found for this project:\n  {project_dir()}")
+        return
+    shown, total = files[:10], len(files)
+    label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
+    print(f"Sessions in this project ({label}, newest first):\n")
+    for f in shown:  # snippet read only for the ones we display
+        ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        snippet = first_user_snippet(f)
+        print(f"  {f.stem}  {ts}" + (f"  {snippet}" if snippet else ""))
+    print("\nRe-run with one:  session-transcript <sessionId>")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(add_help=True)
-    ap.add_argument("session", help="session id, path to .jsonl, or 'last'")
-    ap.add_argument("--project", help="project cwd or encoded project dir to search")
+    ap.add_argument("session", nargs="?",
+                    help="session id; omit to list this project's sessions")
     ap.add_argument("--out", help="output file path")
     ap.add_argument("--tools", dest="tools", action="store_true", default=True)
     ap.add_argument("--no-tools", dest="tools", action="store_false")
     ap.add_argument("--stdout", action="store_true", help="also print transcript")
     args = ap.parse_args()
 
-    path, session_id = resolve_session_file(args.session, args.project)
+    if not args.session:
+        print_session_list()
+        return
+
+    path = find_session_file(args.session)
+    session_id = path.stem
     records = load_records(path)
     transcript = build_transcript(records, session_id, args.tools)
 

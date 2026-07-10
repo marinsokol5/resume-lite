@@ -11,12 +11,12 @@ It's the cheap alternative to `/summarize` for the common case: you open a fresh
 ## What you get
 
 ```
-/light-resume                 # resume the most recent session in this project
+/light-resume                 # list this project's sessions, then pick one
 /light-resume <sessionId>     # resume a specific session
 ```
 
 The `light-resume` skill runs a bundled parser that writes
-`$TMPDIR/claude-code-session-transcript/<sessionId>/summary.md`, reads it back, and
+`$TMPDIR/session-transcript/<sessionId>/summary.md`, reads it back, and
 gives you a short orientation before waiting for direction.
 
 Session ids are the `.jsonl` filenames under `~/.claude/projects/<encoded-cwd>/`.
@@ -47,18 +47,20 @@ it; no third-party dependencies).
 
 ## The parser (standalone)
 
-You can also run the parser directly — e.g. to seed a brand-new session:
+You can also run the parser directly:
 
 ```shell
-skills/light-resume/claude-code-session-transcript <sessionId | path.jsonl | last> \
-  [--project <cwd-or-encoded-dir>] [--out <file>] [--no-tools] [--stdout]
+skills/light-resume/session-transcript                 # list this project's sessions
+skills/light-resume/session-transcript <sessionId> [--out <file>] [--no-tools] [--stdout]
 
-# seed a fresh interactive session with the transcript:
-claude "$(skills/light-resume/claude-code-session-transcript last --stdout --out /dev/null 2>/dev/null)"
+# seed a fresh interactive session with a transcript:
+claude "$(skills/light-resume/session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
 ```
 
-- `last` / `latest` → newest session in the current project (else newest anywhere).
-- Prints the output file path as its final stdout line.
+- No argument → prints this project's sessions (`id · time · first prompt`); pick one.
+- With a `<sessionId>` → prints the output file path as its final stdout line.
+- Sessions are scoped to the current directory's project; ids are the `.jsonl`
+  filenames under `~/.claude/projects/<encoded-cwd>/`.
 
 ## What it keeps / drops
 
