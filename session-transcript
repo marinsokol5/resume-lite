@@ -47,6 +47,10 @@ OUT_ROOT = Path(tempfile.gettempdir()) / "session-transcript"
 # Text blocks that are harness plumbing, not real conversation.
 _SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")
 _CAVEAT = "Caveat: The messages below were generated"
+# Records the harness injects but that aren't conversation carry `isMeta: true`:
+# `/context` dumps, `Base directory for this skill:`, local-command caveats, and
+# "Continue from where you left off." continuations. Real prompts never do. We
+# drop them wholesale rather than pattern-match each text shape (forward-compatible).
 
 
 def encode_cwd(path: str) -> str:
@@ -82,7 +86,7 @@ def first_user_snippet(path: Path, limit: int = 72) -> str:
             except json.JSONDecodeError:
                 continue
             if r.get("type") == "user" and not r.get("isSidechain") \
-                    and isinstance(r.get("message"), dict):
+                    and not r.get("isMeta") and isinstance(r.get("message"), dict):
                 txt = user_text(r["message"])
                 if txt:
                     return _short(txt, limit)
@@ -206,7 +210,7 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> 
         pending_tools.clear()
 
     for r in records:
-        if r.get("isSidechain"):
+        if r.get("isSidechain") or r.get("isMeta"):
             continue
         typ = r.get("type")
         msg = r.get("message")

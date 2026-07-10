@@ -66,7 +66,9 @@ claude "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)
 **Keeps:** real user prompts, assistant text replies, and a one-line `🔧 tools:`
 trace per turn that names each tool **and its target** — files read/edited, URLs
 fetched, search patterns, etc. (`--no-tools` drops the trace for a convo-only view).
-**Drops:** assistant thinking, tool *outputs*, subagent (sidechain) chatter, harness plumbing.
+**Drops:** assistant thinking, tool *outputs*, subagent (sidechain) chatter, and
+harness plumbing (`isMeta` records — `/context` dumps, local-command caveats, skill
+base-dir notices, and "Continue from where you left off." continuations).
 
 It's a memory jog, not a full replay. For exact prior tool results, read the raw
 JSONL under `~/.claude/projects/`.

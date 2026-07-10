@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+"""
+anthropic-evaluate
+
+Measure how many *input tokens* one or more artifacts cost, using Anthropic's
+token-counting endpoint (`POST /v1/messages/count_tokens`) — the ground-truth
+count for a given model, free and unbilled. Built to compare session-handoff
+artifacts (light-resume `summary.md`, `--no-tools` variant, `/export` .txt, the
+raw session `.jsonl`) so you can see the real token cost of each.
+
+Per-file handling:
+    *.jsonl  -> reconstruct the conversation and count it as a full messages=[]
+               request (the honest proxy for what `--resume` re-ingests): every
+               user/assistant record, flattened to text, consecutive same-role
+               records merged so roles alternate.
+    anything -> counted as a single user message containing the whole file
+    else       (summary.md, export .txt, ...).
+
+Usage:
+    scripts/anthropic-evaluate FILE [FILE ...]
+        [--model <id>]   # default claude-opus-4-8
+        [--dry-run]      # don't call the API; print message/char counts only
+        [--json]         # emit machine-readable JSON instead of a table
+
+Auth (only needed without --dry-run): ANTHROPIC_API_KEY (sent as x-api-key), or
+ANTHROPIC_AUTH_TOKEN (sent as a Bearer token for OAuth). No SDK required.
+
+Note: the .jsonl count is an *upper bound* on the real --resume cost — it
+includes every message (sidechains, tool I/O, thinking) rendered as text; the
+live client drops some of that. Both .md/.txt and .jsonl are counted with no
+system prompt or tools, so numbers reflect the artifact's content only.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+DEFAULT_MODEL = "claude-opus-4-8"
+BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+ENDPOINT = "/v1/messages/count_tokens"
+API_VERSION = "2023-06-01"
+
+
+# ---- .jsonl -> messages reconstruction ----------------------------------
+
+def _block_text(block: dict) -> str:
+    """Flatten one content block to the text that carries its token weight."""
+    t = block.get("type")
+    if t == "text":
+        return block.get("text", "")
+    if t == "thinking":
+        return block.get("thinking", "")
+    if t == "tool_use":
+        name = block.get("name", "tool")
+        return f"[tool_use {name} {json.dumps(block.get('input', {}), ensure_ascii=False)}]"
+    if t == "tool_result":
+        c = block.get("content")
+        if isinstance(c, str):
+            body = c
+        elif isinstance(c, list):
+            body = "\n".join(b.get("text", "") for b in c
+                             if isinstance(b, dict) and b.get("type") == "text")
+        else:
+            body = ""
+        return f"[tool_result{' error' if block.get('is_error') else ''}] {body}"
+    if t == "image":
+        return "[image]"
+    return ""  # unknown block types contribute ~nothing as text
+
+
+def _flatten(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(s for s in (_block_text(b) for b in content
+                                     if isinstance(b, dict)) if s)
+    return ""
+
+
+def jsonl_messages(path: Path) -> list[dict]:
+    """All user/assistant turns as text messages, consecutive same-role merged."""
+    msgs: list[dict] = []
+    for line in path.open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("type") not in ("user", "assistant"):
+            continue
+        msg = rec.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        text = _flatten(msg.get("content")).strip()
+        if not text:
+            continue
+        if msgs and msgs[-1]["role"] == role:
+            msgs[-1]["content"] += "\n" + text
+        else:
+            msgs.append({"role": role, "content": text})
+    while msgs and msgs[0]["role"] != "user":  # API requires the first turn to be user
+        msgs.pop(0)
+    return msgs
+
+
+def build_messages(path: Path) -> list[dict]:
+    if path.suffix == ".jsonl":
+        return jsonl_messages(path)
+    return [{"role": "user", "content": path.read_text(encoding="utf-8")}]
+
+
+# ---- token counting -----------------------------------------------------
+
+def auth_headers() -> dict[str, str]:
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if key:
+        return {"x-api-key": key}
+    token = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    if token:
+        return {"Authorization": f"Bearer {token}", "anthropic-beta": "oauth-2025-04-20"}
+    sys.exit("no credentials: set ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN), "
+             "or pass --dry-run to skip the API")
+
+
+def count_tokens(messages: list[dict], model: str, headers: dict[str, str]) -> int:
+    body = json.dumps({"model": model, "messages": messages}).encode("utf-8")
+    req = urllib.request.Request(
+        BASE_URL + ENDPOINT, data=body, method="POST",
+        headers={"content-type": "application/json",
+                 "anthropic-version": API_VERSION, **headers},
+    )
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return json.loads(resp.read())["input_tokens"]
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")[:400]
+        raise SystemExit(f"count_tokens HTTP {e.code}: {detail}")
+
+
+# ---- CLI ----------------------------------------------------------------
+
+def main() -> None:
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("files", nargs="+", help="artifacts to size (.jsonl or text)")
+    ap.add_argument("--model", default=DEFAULT_MODEL, help=f"default {DEFAULT_MODEL}")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="skip the API; show message/char counts only")
+    ap.add_argument("--json", action="store_true", help="emit JSON")
+    args = ap.parse_args()
+
+    headers = None if args.dry_run else auth_headers()
+    rows = []
+    for f in args.files:
+        path = Path(f)
+        if not path.is_file():
+            rows.append({"file": f, "error": "not found"})
+            continue
+        msgs = build_messages(path)
+        kind = "jsonl" if path.suffix == ".jsonl" else "single"
+        chars = sum(len(m["content"]) for m in msgs)
+        row = {"file": path.name, "kind": kind, "messages": len(msgs), "chars": chars}
+        if not msgs:
+            row["error"] = "no messages"
+        elif not args.dry_run:
+            row["tokens"] = count_tokens(msgs, args.model, headers)
+        rows.append(row)
+
+    toks = [r["tokens"] for r in rows if "tokens" in r]
+    lo = min(toks) if toks else 0
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    # Table
+    w = max((len(r["file"]) for r in rows), default=4)
+    if args.dry_run:
+        print(f"{'FILE':<{w}}  {'KIND':<6} {'MSGS':>5} {'CHARS':>9} {'~TOK':>8}")
+        for r in rows:
+            if "error" in r:
+                print(f"{r['file']:<{w}}  {r['error']}")
+                continue
+            print(f"{r['file']:<{w}}  {r['kind']:<6} {r['messages']:>5} "
+                  f"{r['chars']:>9,} {r['chars']//4:>8,}")
+        print("\n(--dry-run: ~TOK is chars/4, a rough estimate; drop --dry-run for exact counts)")
+        return
+
+    print(f"{'FILE':<{w}}  {'KIND':<6} {'MSGS':>5} {'TOKENS':>9} {'×MIN':>6}")
+    for r in rows:
+        if "error" in r:
+            print(f"{r['file']:<{w}}  {r['error']}")
+            continue
+        ratio = f"{r['tokens']/lo:.2f}×" if lo else "-"
+        print(f"{r['file']:<{w}}  {r['kind']:<6} {r['messages']:>5} "
+              f"{r['tokens']:>9,} {ratio:>6}")
+    print(f"\nmodel: {args.model}  ·  counted via {ENDPOINT} (unbilled)")
+
+
+if __name__ == "__main__":
+    main()
