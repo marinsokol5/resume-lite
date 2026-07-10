@@ -963,6 +963,11 @@ def main() -> None:
     session_id = canonical_session_id(records, path, provider)
     transcript = build_transcript(records, session_id, args.tools, provider)
 
+    # Why a file instead of just printing the transcript to stdout for the
+    # invoking agent to consume: a full transcript can be large, and tool
+    # stdout is truncated at the agent's output cap (and would dump the whole
+    # thing into context at once). Writing a file lets the agent Read it with
+    # pagination/offset and re-read spans on demand. Keep this file-first.
     out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(transcript, encoding="utf-8")
