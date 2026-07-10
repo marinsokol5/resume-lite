@@ -2,7 +2,7 @@
 """
 session-transcript
 
-Parse a Claude Code session JSONL and emit a *light* markdown transcript:
+Parse a Claude Code or Codex session JSONL and emit a *light* markdown transcript:
 just the human <-> assistant back-and-forth, with a compact note of which
 tools ran and what they touched (files read/edited, URLs fetched, ...).
 No LLM, no tokens, ~instant.
@@ -19,8 +19,9 @@ Usage:
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
 
-Sessions are scoped to the current directory's Claude Code project. Pass no
-argument to list them (id · time · first prompt); re-run with a chosen id.
+Sessions are scoped to the current directory. Pass no argument to list Claude
+Code and Codex sessions together (provider · id · time · first prompt); re-run
+with a chosen id. With an id, the storage location determines the provider.
 
 Default output:
     $TMPDIR/session-transcript/<sessionId>/summary.md
@@ -35,11 +36,15 @@ import datetime
 import glob
 import json
 import os
+import re
+import shlex
 import sys
 import tempfile
 from pathlib import Path
 
-PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+CODEX_SESSION_DIRS = (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions")
 # Default under the OS temp dir (honors $TMPDIR) so it's writable even under
 # Claude Code's Bash sandbox, which blocks arbitrary /tmp paths.
 OUT_ROOT = Path(tempfile.gettempdir()) / "session-transcript"
@@ -58,23 +63,90 @@ def encode_cwd(path: str) -> str:
     return "".join(c if c.isalnum() else "-" for c in path)
 
 
-def project_dir() -> Path:
+def claude_project_dir() -> Path:
     """The current directory's Claude Code project storage dir."""
-    return PROJECTS_DIR / encode_cwd(os.getcwd())
+    return CLAUDE_PROJECTS_DIR / encode_cwd(os.getcwd())
 
 
-def find_session_file(session: str) -> Path:
-    """Locate a session by id: this project first, then anywhere. Exit if missing."""
-    sid = session[:-6] if session.endswith(".jsonl") else session
-    hits = glob.glob(str(project_dir() / f"{sid}.jsonl"))
-    if not hits:
-        hits = glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
-    if not hits:
-        sys.exit(f"session '{sid}' not found under {PROJECTS_DIR}")
-    return Path(hits[0])
+def _codex_session_files():
+    """Yield active and archived Codex JSONL files without duplicating symlinks."""
+    seen = set()
+    for root in CODEX_SESSION_DIRS:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.jsonl"):
+            key = str(path.resolve())
+            if key not in seen:
+                seen.add(key)
+                yield path
 
 
-def first_user_snippet(path: Path, limit: int = 72) -> str:
+def _detect_provider(path: Path) -> str:
+    """Detect a provider from the first recognizable JSONL record."""
+    try:
+        for i, line in enumerate(path.open(encoding="utf-8")):
+            if i >= 50:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            typ = record.get("type")
+            if typ == "session_meta" and isinstance(record.get("payload"), dict):
+                return "codex"
+            if typ in ("user", "assistant") and isinstance(record.get("message"), dict):
+                return "claude"
+    except OSError as exc:
+        sys.exit(f"cannot read session file '{path}': {exc}")
+    sys.exit(f"cannot detect session format for '{path}'")
+
+
+def _session_matches(path: Path, sid: str, provider: str) -> bool:
+    stem = path.stem
+    if provider == "claude":
+        return stem == sid
+    return stem == sid or stem.endswith(f"-{sid}")
+
+
+def find_session_file(session: str) -> tuple[Path, str]:
+    """Locate a session by id and infer its provider from the matching store."""
+    supplied = Path(session).expanduser()
+    if supplied.is_file():
+        return supplied, _detect_provider(supplied)
+
+    sid = supplied.name
+    if sid.endswith(".jsonl"):
+        sid = sid[:-6]
+
+    hits: list[tuple[Path, str]] = []
+    current = claude_project_dir() / f"{sid}.jsonl"
+    if current.is_file():
+        hits.append((current, "claude"))
+    if CLAUDE_PROJECTS_DIR.is_dir():
+        for path in CLAUDE_PROJECTS_DIR.rglob("*.jsonl"):
+            if path != current and _session_matches(path, sid, "claude"):
+                hits.append((path, "claude"))
+    for path in _codex_session_files():
+        if _session_matches(path, sid, "codex"):
+            hits.append((path, "codex"))
+
+    unique: list[tuple[Path, str]] = []
+    seen = set()
+    for path, provider in hits:
+        key = str(path.resolve())
+        if key not in seen:
+            seen.add(key)
+            unique.append((path, provider))
+    if not unique:
+        roots = f"{CLAUDE_PROJECTS_DIR} or {CODEX_HOME / 'sessions'}"
+        sys.exit(f"session '{sid}' not found under {roots}")
+    if len(unique) > 1:
+        matches = "\n".join(f"  {provider}: {path}" for path, provider in unique)
+        sys.exit(f"session id '{sid}' is ambiguous:\n{matches}")
+    return unique[0]
+
+
+def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
     """First real user prompt in a session, for the listing. Reads only until found."""
     try:
         for line in path.open(encoding="utf-8"):
@@ -85,21 +157,61 @@ def first_user_snippet(path: Path, limit: int = 72) -> str:
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if r.get("type") == "user" and not r.get("isSidechain") \
-                    and not r.get("isMeta") and isinstance(r.get("message"), dict):
+            if provider == "claude" and r.get("type") == "user" \
+                    and not r.get("isSidechain") and not r.get("isMeta") \
+                    and isinstance(r.get("message"), dict):
                 txt = user_text(r["message"])
                 if txt:
+                    return _short(txt, limit)
+            payload = r.get("payload")
+            if provider == "codex" and r.get("type") == "event_msg" \
+                    and isinstance(payload, dict) and payload.get("type") == "user_message":
+                txt = payload.get("message")
+                if isinstance(txt, str) and txt.strip():
                     return _short(txt, limit)
     except OSError:
         pass
     return ""
 
 
-def list_sessions() -> list[Path]:
-    """This project's session .jsonl files, newest first."""
-    files = [Path(f) for f in glob.glob(str(project_dir() / "*.jsonl"))]
-    files.sort(key=lambda f: f.stat().st_mtime, reverse=True)
-    return files
+def _codex_meta(path: Path) -> dict:
+    """Read the small session_meta record at the start of a Codex rollout."""
+    try:
+        for i, line in enumerate(path.open(encoding="utf-8")):
+            if i >= 50:
+                break
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("type") == "session_meta" and isinstance(record.get("payload"), dict):
+                return record["payload"]
+    except OSError:
+        pass
+    return {}
+
+
+def _same_directory(left: str, right: str) -> bool:
+    try:
+        return os.path.realpath(left) == os.path.realpath(right)
+    except (OSError, TypeError):
+        return False
+
+
+def list_sessions() -> list[tuple[Path, str, str]]:
+    """This project's Claude and Codex sessions, newest first."""
+    sessions: list[tuple[Path, str, str]] = []
+    for f in glob.glob(str(claude_project_dir() / "*.jsonl")):
+        path = Path(f)
+        sessions.append((path, "claude", path.stem))
+    for path in _codex_session_files():
+        meta = _codex_meta(path)
+        cwd, sid = meta.get("cwd"), meta.get("id")
+        if isinstance(cwd, str) and isinstance(sid, str) \
+                and _same_directory(cwd, os.getcwd()):
+            sessions.append((path, "codex", sid))
+    sessions.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+    return sessions
 
 
 def load_records(path: Path) -> list[dict]:
@@ -139,6 +251,33 @@ def _short(s: str, n: int = 48) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+def _json_object(value) -> dict:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _target_name(value: str) -> str:
+    value = str(value).strip().strip("'\"").rstrip("/)")
+    return os.path.basename(value) or value
+
+
+def _patch_labels(patch: str) -> list[str]:
+    """Extract exact file operations from an apply_patch payload."""
+    verbs = {"Add": "Write", "Update": "Edit", "Delete": "Delete"}
+    labels = []
+    for action, path in re.findall(
+            r"^\*\*\* (Add|Update|Delete) File: (.+)$", patch, re.MULTILINE):
+        labels.append(f"{verbs[action]}({_short(_target_name(path))})")
+    return list(dict.fromkeys(labels))
+
+
 def tool_label(name: str, inp: dict | None) -> str:
     """Compact `Tool(target)` label — names what the call touched, not its output."""
     inp = inp or {}
@@ -156,6 +295,12 @@ def tool_label(name: str, inp: dict | None) -> str:
     if name == "Bash":
         d = g("description")
         return f"Bash({_short(d)})" if d else name
+    if name == "write_stdin":
+        session_id = g("session_id")
+        return f"write_stdin(session {session_id})" if session_id else name
+    if name == "view_image":
+        path = g("path")
+        return f"view_image({_short(os.path.basename(str(path)))})" if path else name
     if name == "WebFetch":
         u = g("url")
         return f"WebFetch({_short(str(u).split('://', 1)[-1])})" if u else name
@@ -171,7 +316,398 @@ def tool_label(name: str, inp: dict | None) -> str:
     if name == "Skill":
         s = g("skill")
         return f"Skill({_short(s)})" if s else name
+    target = g("file_path", "path", "url", "query", "pattern", "ref_id", "location")
+    if target:
+        return f"{name}({_short(target)})"
     return name
+
+
+_CODEX_CONTROL_TOOLS = {
+    "create_goal", "get_goal", "request_user_input", "update_goal", "update_plan",
+    "wait", "write_stdin",
+}
+_SHELL_SKIP = {
+    "[", "]", "basename", "cut", "dirname", "do", "done", "echo", "else", "exit",
+    "fi", "for", "if", "printf", "pwd", "sort", "test", "then", "tr", "true",
+    "uniq", "while", "xargs",
+}
+
+
+def _shell_segments(command: str) -> list[str]:
+    """Split shell source on unquoted control operators; this is not an executor."""
+    segments, buf = [], []
+    quote = None
+    escaped = False
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if escaped:
+            buf.append(ch)
+            escaped = False
+        elif ch == "\\" and quote != "'":
+            buf.append(ch)
+            escaped = True
+        elif quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+        elif ch in "'\"`":
+            quote = ch
+            buf.append(ch)
+        elif ch in "\n;|" or command.startswith("&&", i) or command.startswith("||", i):
+            segment = "".join(buf).strip()
+            if segment:
+                segments.append(segment)
+            buf = []
+            if command.startswith(("&&", "||"), i):
+                i += 1
+        else:
+            buf.append(ch)
+        i += 1
+    segment = "".join(buf).strip()
+    if segment:
+        segments.append(segment)
+    return segments
+
+
+def _shell_tokens(segment: str) -> list[str]:
+    try:
+        return shlex.split(segment, comments=False, posix=True)
+    except ValueError:
+        return segment.split()
+
+
+def _plain_args(tokens: list[str]) -> list[str]:
+    return [token for token in tokens if token and not token.startswith("-")
+            and not re.match(r"^\d*[<>]", token) and token not in ("(", ")")]
+
+
+def _read_labels(exe: str, tokens: list[str]) -> list[str]:
+    args = tokens[1:]
+    targets: list[str] = []
+    if exe == "sed":
+        positional = _plain_args(args)
+        targets = positional[1:]  # first positional is the sed expression
+    elif exe in ("cat", "file", "wc"):
+        targets = _plain_args(args)
+    elif exe in ("head", "tail"):
+        targets = [arg for arg in _plain_args(args) if not arg.isdigit()]
+    labels = [f"Read({_short(_target_name(path))})" for path in targets
+              if path not in ("-", "/dev/null") and not path.startswith("$(")]
+    return list(dict.fromkeys(labels))
+
+
+def _search_labels(exe: str, tokens: list[str]) -> list[str]:
+    args = tokens[1:]
+    if exe == "rg" and "--files" in args:
+        scopes = [_target_name(arg) for arg in _plain_args(args)
+                  if "/" in arg and not arg.startswith("$(")]
+        return [f"List({_short(scopes[-1])})"] if scopes else ["List(files)"]
+
+    value_options = {
+        "-A", "-B", "-C", "-e", "-f", "-g", "-t", "--after-context",
+        "--before-context", "--context", "--glob", "--iglob", "--type",
+    }
+    positional = []
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in value_options:
+            skip_next = True
+        elif not arg.startswith("-") and not re.match(r"^\d*[<>]", arg):
+            positional.append(arg)
+    if not positional:
+        return ["Search"]
+    pattern = _short(positional[0], 32)
+    targets = [_target_name(arg) for arg in positional[1:] if arg != "-"]
+    detail = f"{pattern} in {', '.join(targets[:2])}" if targets else pattern
+    return [f"Search({_short(detail)})"]
+
+
+def _git_label(tokens: list[str]) -> str:
+    args = _plain_args(tokens[1:])
+    if not args:
+        return "Git"
+    sub = args[0]
+    if sub == "worktree":
+        action = args[1] if len(args) > 1 else ""
+        target = _target_name(args[2]) if len(args) > 2 and action == "add" else ""
+        detail = " ".join(part for part in ("worktree", action, target) if part)
+    elif sub in ("add", "branch", "checkout", "diff", "restore", "show", "switch"):
+        target = _target_name(args[1]) if len(args) > 1 else ""
+        detail = " ".join(part for part in (sub, target) if part)
+    else:
+        detail = sub
+    return f"Git({_short(detail)})"
+
+
+def _run_label(exe: str, tokens: list[str], segment: str) -> str:
+    args = tokens[1:]
+    if exe in ("python", "python3", "ruby") and any(arg in args for arg in ("-c", "-e")):
+        inline_flag = "-c" if "-c" in args else "-e"
+        inline_index = args.index(inline_flag)
+        trailing_args = args[inline_index + 2:]
+        paths = re.findall(r"(?:open|read_text)\(\s*['\"]([^'\"]+)", segment)
+        paths += [arg for arg in trailing_args
+                  if "/" in arg or re.search(r"\.[A-Za-z0-9]{1,8}$", arg)]
+        target = _target_name(paths[-1]) if paths else "inline"
+        if "compile(" in segment or "py_compile" in segment:
+            return f"SyntaxCheck({_short(target)})"
+        if "assert " in segment or "assert(" in segment:
+            return f"Test({_short(target)})"
+        if "YAML" in segment or "frontmatter" in segment:
+            return f"Validate({_short(target)})"
+        return f"Run({_short(exe + ' ' + target)})"
+
+    plain = _plain_args(args)
+    if exe in ("python", "python3", "node", "ruby") and plain:
+        return f"Run({_short(_target_name(plain[0]))})"
+    if exe in ("python", "python3", "ruby"):
+        return f"Run({exe} inline)"
+    if exe in ("pytest", "swift", "cargo", "make", "npm", "npx"):
+        detail = " ".join([exe] + plain[:2])
+        return f"Run({_short(detail)})"
+    if tokens[0].startswith(("./", "/")):
+        return f"Run({_short(_target_name(tokens[0]))})"
+    return f"Shell({_short(exe)})"
+
+
+def _shell_segment_labels(segment: str) -> list[str]:
+    tokens = _shell_tokens(segment)
+    while tokens and ("=" in tokens[0] and not tokens[0].startswith(("./", "/"))):
+        tokens.pop(0)
+    while tokens and os.path.basename(tokens[0]) in ("command", "env", "sudo"):
+        tokens.pop(0)
+    if not tokens:
+        return []
+    exe = os.path.basename(tokens[0])
+    if exe in _SHELL_SKIP or exe.startswith(("$", "-")):
+        return []
+    if exe in ("cat", "file", "head", "sed", "tail", "wc"):
+        return _read_labels(exe, tokens)
+    if exe in ("grep", "rg"):
+        return _search_labels(exe, tokens)
+    if exe in ("find", "fd"):
+        args = _plain_args(tokens[1:])
+        return [f"Find({_short(_target_name(args[0]))})"] if args else ["Find"]
+    if exe == "ls":
+        args = _plain_args(tokens[1:])
+        target = _target_name(args[-1]) if args else "cwd"
+        return [f"List({_short(target)})"]
+    if exe == "git":
+        return [_git_label(tokens)]
+    if exe in ("python", "python3", "node", "ruby", "pytest", "swift", "cargo",
+               "make", "npm", "npx") or tokens[0].startswith(("./", "/")):
+        return [_run_label(exe, tokens, segment)]
+    if exe == "jq":
+        targets = [arg for arg in tokens[1:] if re.search(r"\.(?:json|jsonl)$", arg)
+                   or (arg.startswith(("/", "$")) and not re.search(r"[\s|(){}]", arg))]
+        target = _target_name(targets[-1]) if targets else "JSON"
+        return [f"Inspect({_short(target)})"]
+    if exe == "which":
+        args = _plain_args(tokens[1:])
+        return [f"Locate({_short(', '.join(args[:3]))})"] if args else []
+    if exe == "codex":
+        args = _plain_args(tokens[1:])
+        return [f"Codex({_short(' '.join(args[:3]) or 'run')})"]
+    if exe in ("cmp", "diff"):
+        args = _plain_args(tokens[1:])
+        if len(args) >= 2:
+            detail = f"{_target_name(args[-2])} ↔ {_target_name(args[-1])}"
+            return [f"Compare({_short(detail)})"]
+    if exe in ("cp", "mv"):
+        args = _plain_args(tokens[1:])
+        if len(args) >= 2:
+            verb = "Copy" if exe == "cp" else "Move"
+            return [f"{verb}({_short(_target_name(args[0]) + ' → ' + _target_name(args[1]))})"]
+    if exe in ("mkdir", "touch"):
+        return [f"Write({_short(_target_name(arg))})" for arg in _plain_args(tokens[1:])]
+    if exe == "rm":
+        return [f"Delete({_short(_target_name(arg))})" for arg in _plain_args(tokens[1:])]
+    if exe in ("curl", "wget"):
+        urls = [arg for arg in tokens[1:] if arg.startswith(("http://", "https://"))]
+        return [f"WebFetch({_short(url.split('://', 1)[-1])})" for url in urls]
+    targets = [arg for arg in tokens[1:] if not re.search(r"[\s|(){}]", arg)
+               and (arg.startswith(("/", "$"))
+                    or re.search(r"\.[A-Za-z0-9]{1,8}$", arg))]
+    return [f"Shell({exe} → {_short(_target_name(targets[-1]))})"] if targets else []
+
+
+def _shell_labels(command: str) -> list[str]:
+    heredoc = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)", command)
+    if heredoc:
+        header = command.splitlines()[0]
+        tokens = _shell_tokens(header)
+        exe = os.path.basename(tokens[0]) if tokens else "shell"
+        if "assert " in command or "assert(" in command:
+            return ["Test(inline)"]
+        return [f"Run({_short(exe + ' inline')})"]
+    labels = []
+    for segment in _shell_segments(command):
+        labels.extend(_shell_segment_labels(segment))
+    return list(dict.fromkeys(labels))
+
+
+def _js_code_mask(source: str) -> str:
+    """Mask JavaScript string/comment contents while preserving source offsets."""
+    masked = list(source)
+    state = None
+    escaped = False
+    i = 0
+    while i < len(source):
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < len(source) else ""
+        if state in ("'", '"', "`"):
+            if escaped:
+                masked[i] = " "
+                escaped = False
+            elif ch == "\\":
+                masked[i] = " "
+                escaped = True
+            elif ch == state:
+                state = None  # keep the closing quote
+            else:
+                masked[i] = "\n" if ch == "\n" else " "
+        elif state == "line-comment":
+            if ch == "\n":
+                state = None
+            else:
+                masked[i] = " "
+        elif state == "block-comment":
+            masked[i] = "\n" if ch == "\n" else " "
+            if ch == "*" and nxt == "/":
+                masked[i + 1] = " "
+                state = None
+                i += 1
+        elif ch in ("'", '"', "`"):
+            state = ch  # keep delimiters so values can be decoded from the source
+        elif ch == "/" and nxt == "/":
+            masked[i] = masked[i + 1] = " "
+            state = "line-comment"
+            i += 1
+        elif ch == "/" and nxt == "*":
+            masked[i] = masked[i + 1] = " "
+            state = "block-comment"
+            i += 1
+        i += 1
+    return "".join(masked)
+
+
+def _js_string_bindings(source: str) -> dict[str, str]:
+    bindings = {}
+    decoder = json.JSONDecoder()
+    pattern = re.compile(r"\b(?:const|let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*")
+    for match in pattern.finditer(_js_code_mask(source)):
+        tail = source[match.end():].lstrip()
+        if not tail.startswith('"'):
+            continue
+        try:
+            value, _ = decoder.raw_decode(tail)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str):
+            bindings[match.group(1)] = value
+    return bindings
+
+
+def _js_property_strings(source: str, key: str) -> list[str]:
+    values = []
+    decoder = json.JSONDecoder()
+    masked = _js_code_mask(source)
+    for match in re.finditer(rf"\b{re.escape(key)}\s*:\s*", masked):
+        tail = source[match.end():].lstrip()
+        if not tail.startswith('"'):
+            continue
+        try:
+            value, _ = decoder.raw_decode(tail)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, str):
+            values.append(value)
+    return values
+
+
+def _codex_function_labels(name: str, args: dict) -> list[str]:
+    if name in _CODEX_CONTROL_TOOLS:
+        return []
+    if name in ("exec_command", "shell_command"):
+        command = args.get("cmd") or args.get("command")
+        return _shell_labels(command) if isinstance(command, str) else [name]
+    return [tool_label(name, args)]
+
+
+def _nested_exec_labels(source: str) -> list[str]:
+    """Extract nested tool names (and JSON arguments when available) from exec JS."""
+    labels = []
+    decoder = json.JSONDecoder()
+    bindings = _js_string_bindings(source)
+    masked = _js_code_mask(source)
+    for match in re.finditer(r"\btools\.([A-Za-z_][A-Za-z0-9_]*)\s*\(", masked):
+        name, tail = match.group(1), source[match.end():].lstrip()
+        args = {}
+        raw = None
+        if tail.startswith("{"):
+            try:
+                parsed, _ = decoder.raw_decode(tail)
+                if isinstance(parsed, dict):
+                    args = parsed
+            except json.JSONDecodeError:
+                pass
+        elif tail.startswith('"'):
+            try:
+                raw, _ = decoder.raw_decode(tail)
+            except json.JSONDecodeError:
+                pass
+        else:
+            identifier = re.match(r"([A-Za-z_][A-Za-z0-9_]*)", tail)
+            if identifier:
+                raw = bindings.get(identifier.group(1))
+
+        if name == "apply_patch" and isinstance(raw, str):
+            labels.extend(_patch_labels(raw) or ["apply_patch"])
+        elif name == "web__run" and not args:
+            queries = _js_property_strings(tail[:8000], "q")
+            refs = _js_property_strings(tail[:8000], "ref_id")
+            labels.extend(f"WebSearch({_short(query)})" for query in queries[:4])
+            labels.extend(f"WebOpen({_short(ref)})" for ref in refs[:4])
+            if not queries and not refs:
+                labels.append("web__run")
+        else:
+            labels.extend(_codex_function_labels(name, args))
+    return list(dict.fromkeys(labels))
+
+
+def codex_tool_labels(payload: dict) -> list[str]:
+    """Return compact labels for a Codex response_item tool call."""
+    typ = payload.get("type")
+    if typ == "function_call":
+        return _codex_function_labels(
+            payload.get("name", "tool"), _json_object(payload.get("arguments")))
+    if typ == "custom_tool_call":
+        name, raw = payload.get("name", "tool"), payload.get("input")
+        if name == "apply_patch" and isinstance(raw, str):
+            return _patch_labels(raw) or [name]
+        if name == "exec" and isinstance(raw, str):
+            return _nested_exec_labels(raw)
+        return [name]
+    if typ == "web_search_call":
+        action = payload.get("action")
+        if not isinstance(action, dict):
+            return ["web_search"]
+        action_type = action.get("type")
+        if action_type == "search":
+            query = action.get("query") or action.get("queries")
+            return [tool_label("WebSearch", {"query": query})]
+        if action_type == "open_page":
+            return [tool_label("WebOpen", {"url": action.get("url")})]
+        if action_type == "find_in_page":
+            return [tool_label("WebFind", {"pattern": action.get("pattern")})]
+        return ["web_search"]
+    if typ == "tool_search_call":
+        return ["tool_search"]
+    return []
 
 
 def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
@@ -193,8 +729,111 @@ def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
     return texts, tools
 
 
-def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> str:
-    cwd = next((r.get("cwd") for r in records if r.get("cwd")), "")
+def _codex_message_text(payload: dict) -> str | None:
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [item.get("text", "") for item in content
+             if isinstance(item, dict)
+             and item.get("type") in ("input_text", "output_text", "text")
+             and isinstance(item.get("text"), str)]
+    text = "\n".join(parts).strip()
+    return text or None
+
+
+def normalized_events(records: list[dict], provider: str):
+    """Yield (user|assistant|tool, text) events from either provider."""
+    if provider == "claude":
+        for r in records:
+            if r.get("isSidechain") or r.get("isMeta"):
+                continue
+            typ, msg = r.get("type"), r.get("message")
+            if not isinstance(msg, dict):
+                continue
+            if typ == "user":
+                text = user_text(msg)
+                if text is not None:
+                    yield "user", text
+            elif typ == "assistant":
+                texts, tools = assistant_parts(msg)
+                for label in tools:
+                    yield "tool", label
+                for text in texts:
+                    yield "assistant", text
+        return
+
+    event_types = {r.get("payload", {}).get("type") for r in records
+                   if r.get("type") == "event_msg"
+                   and isinstance(r.get("payload"), dict)}
+    for r in records:
+        payload = r.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if r.get("type") == "event_msg":
+            typ, text = payload.get("type"), payload.get("message")
+            if not isinstance(text, str) or not text.strip():
+                continue
+            if typ == "user_message":
+                yield "user", text.strip()
+            elif typ == "agent_message":
+                yield "assistant", text.strip()
+        elif r.get("type") == "response_item":
+            if payload.get("type") == "message":
+                role, text = payload.get("role"), _codex_message_text(payload)
+                if role == "user" and "user_message" not in event_types and text:
+                    yield "user", text
+                elif role == "assistant" and "agent_message" not in event_types and text:
+                    yield "assistant", text
+            for label in codex_tool_labels(payload):
+                yield "tool", label
+
+
+def _session_cwd(records: list[dict], provider: str) -> str:
+    if provider == "claude":
+        return next((r.get("cwd") for r in records if r.get("cwd")), "")
+    for r in records:
+        payload = r.get("payload")
+        if r.get("type") in ("session_meta", "turn_context") and isinstance(payload, dict):
+            if payload.get("cwd"):
+                return payload["cwd"]
+    return ""
+
+
+def canonical_session_id(records: list[dict], path: Path, provider: str) -> str:
+    if provider == "codex":
+        for r in records:
+            payload = r.get("payload")
+            if r.get("type") == "session_meta" and isinstance(payload, dict):
+                if isinstance(payload.get("id"), str):
+                    return payload["id"]
+    return path.stem
+
+
+def _compact_tool_labels(labels: list[str]) -> list[str]:
+    """Deduplicate tool labels and cap repetitive categories without losing edits."""
+    unique = list(dict.fromkeys(labels))
+    caps = {"Read": 6, "Run": 4, "Search": 4, "WebOpen": 3, "WebSearch": 3}
+    totals: dict[str, int] = {}
+    for label in unique:
+        kind = label.split("(", 1)[0]
+        totals[kind] = totals.get(kind, 0) + 1
+
+    compact, seen = [], {}
+    for label in unique:
+        kind = label.split("(", 1)[0]
+        count = seen.get(kind, 0)
+        cap = caps.get(kind)
+        if cap is None or count < cap:
+            compact.append(label)
+        elif count == cap:
+            compact.append(f"{kind}(+{totals[kind] - cap} more)")
+        seen[kind] = count + 1
+    return compact
+
+
+def build_transcript(records: list[dict], session_id: str, show_tools: bool,
+                     provider: str) -> str:
+    cwd = _session_cwd(records, provider)
     timestamps = [r.get("timestamp") for r in records if r.get("timestamp")]
     span = f"{timestamps[0]} → {timestamps[-1]}" if timestamps else ""
 
@@ -205,41 +844,32 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> 
 
     def flush_tools():
         if show_tools and pending_tools:
-            uniq = ", ".join(dict.fromkeys(pending_tools))
-            lines.append(f"_🔧 tools: {uniq}_\n")
+            compact = ", ".join(_compact_tool_labels(pending_tools))
+            lines.append(f"_🔧 tools: {compact}_\n")
         pending_tools.clear()
 
-    for r in records:
-        if r.get("isSidechain") or r.get("isMeta"):
-            continue
-        typ = r.get("type")
-        msg = r.get("message")
-        if not isinstance(msg, dict):
-            continue
-
+    assistant_name = "Claude" if provider == "claude" else "Codex"
+    for typ, value in normalized_events(records, provider):
         if typ == "user":
-            txt = user_text(msg)
-            if txt is None:
-                continue
             flush_tools()
             exchanges += 1
-            lines.append(f"## 👤 User\n\n{txt}\n")
+            lines.append(f"## 👤 User\n\n{value}\n")
         elif typ == "assistant":
-            texts, tools = assistant_parts(msg)
-            pending_tools += tools
-            for t in texts:
-                flush_tools()
-                lines.append(f"## 🤖 Claude\n\n{t}\n")
+            flush_tools()
+            lines.append(f"## 🤖 {assistant_name}\n\n{value}\n")
+        elif typ == "tool":
+            pending_tools.append(value)
     flush_tools()
 
+    source = "Claude Code" if provider == "claude" else "Codex"
     header = [
         f"# Session transcript — `{session_id}`",
         "",
-        f"_Project: `{cwd}` · {exchanges} user turns · {span}_",
+        f"_Source: {source} · Project: `{cwd}` · {exchanges} user turns · {span}_",
         "",
         "> Light transcript (human ↔ assistant text; each tool call noted with its "
-        "target — tool *outputs* and thinking omitted). Read it to recover where we "
-        "left off, then continue the work.",
+        "target when available — tool *outputs* and thinking omitted). Read it to "
+        "recover where we left off, then continue the work.",
         "",
         "---",
         "",
@@ -249,17 +879,17 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool) -> 
 
 def print_session_list() -> None:
     """No session id given: list this project's sessions so one can be chosen."""
-    files = list_sessions()
-    if not files:
-        print(f"No Claude Code sessions found for this project:\n  {project_dir()}")
+    sessions = list_sessions()
+    if not sessions:
+        print("No Claude Code or Codex sessions found for this project.")
         return
-    shown, total = files[:10], len(files)
+    shown, total = sessions[:10], len(sessions)
     label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
     print(f"Sessions in this project ({label}, newest first):\n")
-    for f in shown:  # snippet read only for the ones we display
-        ts = datetime.datetime.fromtimestamp(f.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-        snippet = first_user_snippet(f)
-        print(f"  {f.stem}  {ts}" + (f"  {snippet}" if snippet else ""))
+    for path, provider, sid in shown:  # snippet read only for displayed sessions
+        ts = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        snippet = first_user_snippet(path, provider)
+        print(f"  {provider:<6}  {sid}  {ts}" + (f"  {snippet}" if snippet else ""))
     print("\nRe-run with one:  session-transcript <sessionId>")
 
 
@@ -277,10 +907,10 @@ def main() -> None:
         print_session_list()
         return
 
-    path = find_session_file(args.session)
-    session_id = path.stem
+    path, provider = find_session_file(args.session)
     records = load_records(path)
-    transcript = build_transcript(records, session_id, args.tools)
+    session_id = canonical_session_id(records, path, provider)
+    transcript = build_transcript(records, session_id, args.tools, provider)
 
     out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
     out.parent.mkdir(parents=True, exist_ok=True)
