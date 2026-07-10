@@ -20,4 +20,4 @@ __pycache__/
 /tmp/claude-code-session-transcript/
 
 # Local /export dumps used only for token comparisons
-/scripts/exports/
+/eval/exports/

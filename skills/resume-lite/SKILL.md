@@ -12,22 +12,24 @@ read the deterministic result.
 
 ## Steps
 
-1. **Locate the bundled parser.** The script sits next to this `SKILL.md`, but the
-   skill's install root varies, so find it in the standard Codex and Claude roots:
+1. **Locate the bundled parser.** The script ships in `scripts/` beside this
+   `SKILL.md`, but the skill's install root varies, so find it in the standard
+   Codex, Claude, and universal (`.agents`) skill roots:
 
    ```bash
    SCRIPT="$(find -L "${CODEX_HOME:-$HOME/.codex}/skills" \
         "$PWD/.codex/skills" ~/.claude/skills "$PWD/.claude/skills" \
-        -path '*/resume-lite/session-transcript' 2>/dev/null | sort | tail -1)"
+        ~/.agents/skills "$PWD/.agents/skills" \
+        -path '*/resume-lite/scripts/session-transcript' 2>/dev/null | sort | tail -1)"
    ```
 
 2. **Pick the session.**
    - If the user gave a session id in their args (`$ARGUMENTS`), use it.
-   - If they gave **nothing**, run `"$SCRIPT"` with no argument to print the list
-     of this project's sessions (`provider · id · time · first prompt`), show it
-     to the user, and ask which to resume. Don't guess; wait for an id.
+   - If they gave **nothing**, run `python3 "$SCRIPT"` with no argument to print
+     the list of this project's sessions (`provider · id · time · first prompt`),
+     show it to the user, and ask which to resume. Don't guess; wait for an id.
 
-3. **Run the parser with the chosen id:** `"$SCRIPT" "<sessionId>"`. It prints the
+3. **Run the parser with the chosen id:** `python3 "$SCRIPT" "<sessionId>"`. It prints the
    output file path as its last stdout line, e.g.
    `$TMPDIR/session-transcript/<sessionId>/summary.md`. The matching storage
    location automatically selects the Claude or Codex adapter.

@@ -32,7 +32,7 @@ Random Codex session:
 
 ## Install
 
-Plain Agent Skill — no plugin or marketplace. Needs Python 3, no dependencies.
+Plain Agent Skill, needs Python 3.
 
 ```shell
 # Skills CLI
@@ -41,7 +41,7 @@ npx skills add marinsokol5/resume-lite
 
 ## Use it
 
-As a skill (`/resume-lite` in Claude Code, `resume-lite` in Codex):
+As a skill (`/resume-lite` in Claude Code, `$resume-lite` in Codex):
 
 ```
 /resume-lite <sessionId>
@@ -54,7 +54,7 @@ short orientation.
 Or run the parser directly:
 
 ```shell
-./session-transcript <sessionId>     # write the transcript, print its path
+skills/resume-lite/scripts/session-transcript <sessionId>   # write the transcript, print its path
 ```
 
 Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
@@ -63,8 +63,8 @@ Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
 Cross-provider handoff — seed either agent with a session from the other:
 
 ```shell
-claude "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
-codex  "$(./session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
+claude "$(skills/resume-lite/scripts/session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
+codex  "$(skills/resume-lite/scripts/session-transcript <sessionId> --stdout --out /dev/null 2>/dev/null)"
 ```
 
 The session id picks the store and adapter automatically.

@@ -16,7 +16,7 @@ freely. Per-arg handling:
     session id -> expands to the full comparison in one shot: the raw .jsonl
                   (the `--resume` baseline), resume-lite rendered in both
                   `--tools` and `--no-tools` modes (via the sibling
-                  session-transcript script), and — if scripts/exports/<id>.md
+                  session-transcript script), and — if eval/exports/<id>.md
                   exists — the `/export` dump. Claude sessions are found in the
                   current project or anywhere under ~/.claude/projects; Codex
                   sessions under $CODEX_HOME/sessions (and archived_sessions).
@@ -63,9 +63,9 @@ API_VERSION = "2023-06-01"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 CODEX_SESSION_DIRS = (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions")
-# Sibling script (repo root) that renders a session .jsonl into a light transcript.
-TRANSCRIPT = Path(__file__).resolve().parent.parent / "session-transcript"
-# Where `/export <id>.md` dumps live; a session id auto-picks up scripts/exports/<id>.md.
+# Bundled skill parser that renders a session .jsonl into a light transcript.
+TRANSCRIPT = Path(__file__).resolve().parent.parent / "skills" / "resume-lite" / "scripts" / "session-transcript"
+# Where `/export <id>.md` dumps live; a session id auto-picks up eval/exports/<id>.md.
 EXPORTS_DIR = Path(__file__).resolve().parent / "exports"
 
 
