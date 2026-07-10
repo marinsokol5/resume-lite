@@ -8,18 +8,23 @@ count for a given model, free and unbilled. Built to compare session-handoff
 artifacts (light-resume `summary.md`, `--no-tools` variant, `/export` .txt, the
 raw session `.jsonl`) so you can see the real token cost of each.
 
+Works with both Claude Code and Codex sessions; the storage location a session
+id resolves to selects the provider automatically.
+
 Each positional arg is either a **file path** or a bare **session id**; mix them
 freely. Per-arg handling:
     session id -> expands to the full comparison in one shot: the raw .jsonl
                   (the `--resume` baseline), light-resume rendered in both
                   `--tools` and `--no-tools` modes (via the sibling
                   session-transcript script), and — if scripts/exports/<id>.md
-                  exists — the `/export` dump. The session is found in the
-                  current project, or anywhere under ~/.claude/projects.
+                  exists — the `/export` dump. Claude sessions are found in the
+                  current project or anywhere under ~/.claude/projects; Codex
+                  sessions under $CODEX_HOME/sessions (and archived_sessions).
     *.jsonl    -> reconstruct the conversation and count it as a full messages=[]
                   request (the honest proxy for what `--resume` re-ingests):
                   every user/assistant record, flattened to text, consecutive
-                  same-role records merged so roles alternate.
+                  same-role records merged so roles alternate. The provider
+                  (Claude or Codex) is detected from the file's records.
     other file -> counted as a single user message containing the whole file
                   (summary.md, export .txt, a /compact summary, ...).
 
@@ -56,6 +61,8 @@ BASE_URL = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rst
 ENDPOINT = "/v1/messages/count_tokens"
 API_VERSION = "2023-06-01"
 PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+CODEX_SESSION_DIRS = (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions")
 # Sibling script (repo root) that renders a session .jsonl into a light transcript.
 TRANSCRIPT = Path(__file__).resolve().parent.parent / "session-transcript"
 # Where `/export <id>.md` dumps live; a session id auto-picks up scripts/exports/<id>.md.
@@ -70,13 +77,80 @@ def _project_dir() -> Path:
     return PROJECTS_DIR / encoded
 
 
-def find_session_jsonl(sid: str) -> Path | None:
-    """Locate a session id's .jsonl: this project first, then anywhere. None if missing."""
-    sid = sid[:-6] if sid.endswith(".jsonl") else sid
-    hits = glob.glob(str(_project_dir() / f"{sid}.jsonl"))
-    if not hits:
-        hits = glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True)
-    return Path(hits[0]) if hits else None
+def _codex_session_files():
+    """Yield active and archived Codex JSONL files without duplicating symlinks."""
+    seen = set()
+    for root in CODEX_SESSION_DIRS:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.jsonl"):
+            key = str(path.resolve())
+            if key not in seen:
+                seen.add(key)
+                yield path
+
+
+def _detect_provider(path: Path) -> str:
+    """Provider of a session file from its first recognizable record; 'claude' if unsure."""
+    try:
+        for i, line in enumerate(path.open(encoding="utf-8")):
+            if i >= 50:
+                break
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            typ = rec.get("type")
+            if typ == "session_meta" and isinstance(rec.get("payload"), dict):
+                return "codex"
+            if typ in ("user", "assistant") and isinstance(rec.get("message"), dict):
+                return "claude"
+            if typ in ("response_item", "event_msg", "turn_context"):
+                return "codex"
+    except OSError:
+        pass
+    return "claude"
+
+
+def _codex_canonical_id(path: Path) -> str:
+    """Codex session's stable id from its session_meta record; stem as fallback."""
+    try:
+        for i, line in enumerate(path.open(encoding="utf-8")):
+            if i >= 50:
+                break
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload = rec.get("payload")
+            if rec.get("type") == "session_meta" and isinstance(payload, dict) \
+                    and isinstance(payload.get("id"), str):
+                return payload["id"]
+    except OSError:
+        pass
+    return path.stem
+
+
+def find_session(arg: str) -> tuple[Path, str] | None:
+    """Locate a session id and its provider: this Claude project first, then any
+    Claude project, then Codex stores. Codex ids match the rollout's `-<id>` tail.
+    Returns (path, provider) or None if nothing matches."""
+    sid = arg[:-6] if arg.endswith(".jsonl") else arg
+    current = _project_dir() / f"{sid}.jsonl"
+    if current.is_file():
+        return current, "claude"
+    for hit in glob.glob(str(PROJECTS_DIR / "**" / f"{sid}.jsonl"), recursive=True):
+        return Path(hit), "claude"
+    for path in _codex_session_files():
+        stem = path.stem
+        if stem == sid or stem.endswith(f"-{sid}"):
+            return path, "codex"
+    return None
+
+
+def canonical_sid(path: Path, provider: str) -> str:
+    """The id used for labels, the exports lookup, and the transcript subprocess."""
+    return _codex_canonical_id(path) if provider == "codex" else path.stem
 
 
 def render_transcript(sid: str, mode: str) -> Path | None:
@@ -96,12 +170,14 @@ def items_for_arg(arg: str) -> list[tuple[str, str | None, list[dict] | None]]:
         kind = "jsonl" if p.suffix == ".jsonl" else "single"
         return [(p.name, kind, build_messages(p))]
 
-    jsonl = find_session_jsonl(arg)
-    if jsonl is None:
+    found = find_session(arg)
+    if found is None:
         return [(arg, None, None)]  # unresolvable -> error row
-    sid, short = jsonl.stem, jsonl.stem[:8]
+    path, provider = found
+    sid = canonical_sid(path, provider)
+    short = sid[:8]
     rows: list[tuple[str, str | None, list[dict] | None]] = [
-        (f"{short} --resume (.jsonl)", "jsonl", jsonl_messages(jsonl)),
+        (f"{short} --resume (.jsonl)", "jsonl", jsonl_messages(path, provider)),
     ]
     export = EXPORTS_DIR / f"{sid}.md"  # a matching /export dump, if one exists
     if export.is_file():
@@ -150,8 +226,25 @@ def _flatten(content) -> str:
     return ""
 
 
-def jsonl_messages(path: Path) -> list[dict]:
-    """All user/assistant turns as text messages, consecutive same-role merged."""
+def _append(msgs: list[dict], role: str, text: str) -> None:
+    """Add a turn, merging into the previous one when the role repeats."""
+    text = text.strip()
+    if not text:
+        return
+    if msgs and msgs[-1]["role"] == role:
+        msgs[-1]["content"] += "\n" + text
+    else:
+        msgs.append({"role": role, "content": text})
+
+
+def _finish(msgs: list[dict]) -> list[dict]:
+    while msgs and msgs[0]["role"] != "user":  # API requires the first turn to be user
+        msgs.pop(0)
+    return msgs
+
+
+def _claude_jsonl_messages(path: Path) -> list[dict]:
+    """All Claude user/assistant turns as text messages, consecutive same-role merged."""
     msgs: list[dict] = []
     for line in path.open(encoding="utf-8"):
         line = line.strip()
@@ -169,16 +262,89 @@ def jsonl_messages(path: Path) -> list[dict]:
         role = msg.get("role")
         if role not in ("user", "assistant"):
             continue
-        text = _flatten(msg.get("content")).strip()
-        if not text:
+        _append(msgs, role, _flatten(msg.get("content")))
+    return _finish(msgs)
+
+
+def _codex_content_text(content) -> str:
+    """Join the text blocks of a Codex `message` content array."""
+    if not isinstance(content, list):
+        return ""
+    parts = [b.get("text", "") for b in content if isinstance(b, dict)
+             and b.get("type") in ("input_text", "output_text", "text")
+             and isinstance(b.get("text"), str)]
+    return "\n".join(p for p in parts if p)
+
+
+def _codex_reasoning_text(payload: dict) -> str:
+    """Visible reasoning (summary + any plaintext content); the encrypted blob is skipped."""
+    parts: list[str] = []
+    for key in ("summary", "content"):
+        blocks = payload.get(key)
+        if isinstance(blocks, list):
+            parts += [b.get("text", "") for b in blocks
+                      if isinstance(b, dict) and isinstance(b.get("text"), str)]
+    return "\n".join(p for p in parts if p)
+
+
+def _codex_response_item(payload: dict) -> tuple[str, str] | None:
+    """Flatten a Codex response_item into (role, text). None for non-conversation items."""
+    t = payload.get("type")
+    if t == "message":
+        role = payload.get("role")
+        if role in ("user", "assistant"):
+            return role, _codex_content_text(payload.get("content"))
+        return None
+    if t == "reasoning":
+        return "assistant", _codex_reasoning_text(payload)
+    if t == "function_call":
+        name = payload.get("name", "tool")
+        args = payload.get("arguments")
+        args = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False)
+        return "assistant", f"[tool_use {name} {args}]"
+    if t == "custom_tool_call":
+        name = payload.get("name", "tool")
+        inp = payload.get("input")
+        inp = inp if isinstance(inp, str) else json.dumps(inp or {}, ensure_ascii=False)
+        return "assistant", f"[tool_use {name} {inp}]"
+    if t in ("function_call_output", "custom_tool_call_output"):
+        out = payload.get("output")
+        out = out if isinstance(out, str) else json.dumps(out or "", ensure_ascii=False)
+        return "user", f"[tool_result] {out}"
+    return None  # ghost_snapshot, plan updates, etc. carry no token weight here
+
+
+def _codex_jsonl_messages(path: Path) -> list[dict]:
+    """Codex conversation as text messages. Reconstructed from `response_item` records
+    (the actual model-input history); `event_msg` records are UI duplicates and skipped.
+    Tool calls map to assistant turns, tool outputs to user turns, so roles alternate."""
+    msgs: list[dict] = []
+    for line in path.open(encoding="utf-8"):
+        line = line.strip()
+        if not line:
             continue
-        if msgs and msgs[-1]["role"] == role:
-            msgs[-1]["content"] += "\n" + text
-        else:
-            msgs.append({"role": role, "content": text})
-    while msgs and msgs[0]["role"] != "user":  # API requires the first turn to be user
-        msgs.pop(0)
-    return msgs
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if rec.get("type") != "response_item":
+            continue
+        payload = rec.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        parsed = _codex_response_item(payload)
+        if parsed:
+            _append(msgs, *parsed)
+    return _finish(msgs)
+
+
+def jsonl_messages(path: Path, provider: str | None = None) -> list[dict]:
+    """Reconstruct a session .jsonl into alternating text messages (provider auto-detected)."""
+    if provider is None:
+        provider = _detect_provider(path)
+    if provider == "codex":
+        return _codex_jsonl_messages(path)
+    return _claude_jsonl_messages(path)
 
 
 def build_messages(path: Path) -> list[dict]:
