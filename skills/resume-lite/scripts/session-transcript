@@ -14,11 +14,11 @@ Two modes:
     convo-only (--no-tools) — just the human <-> assistant text.
 
 Usage:
-    session-transcript                 # list this project's sessions, then exit
-    session-transcript <sessionId>     # write a transcript for that session
-        [--out <file>]           # override output path
+    session-transcript                        # list this project's sessions, then exit
+    session-transcript <sessionId> [...]      # write a transcript per session
+        [--out <file>]           # override output path (single session only)
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
-        [--stdout]               # also print the transcript to stdout
+        [--stdout]               # also print the transcript(s) to stdout
 
 Sessions are scoped to the current directory. Pass no argument to list Claude
 Code and Codex sessions together (provider · id · time · first prompt); re-run
@@ -27,7 +27,8 @@ with a chosen id. With an id, the storage location determines the provider.
 Default output:
     $TMPDIR/session-transcript/<sessionId>/summary.md
 
-With a sessionId, the output file path is printed to stdout (last line).
+With session ids, the output file paths are printed to stdout (last lines,
+one per session, in argument order).
 """
 
 from __future__ import annotations
@@ -967,19 +968,20 @@ def main() -> None:
             "~instant."),
         epilog=(
             "modes:\n"
-            "  session-transcript                 list this project's "
+            "  session-transcript                       list this project's "
             "sessions, then exit\n"
-            "  session-transcript <sessionId>     write that session's "
-            "transcript\n\n"
+            "  session-transcript <sessionId> [...]     write a transcript "
+            "per session\n\n"
             "Sessions are scoped to the current directory. Lookup by id "
             "searches the\nClaude Code and Codex stores; the matching store "
             "selects the provider.\n\n"
-            "With an id, the transcript's file path is printed as the LAST "
-            "stdout line\n(read that file). Default location:\n"
+            "With ids, the transcript file paths are printed as the LAST "
+            "stdout lines,\none per session in argument order (read those "
+            "files). Default location:\n"
             "  $TMPDIR/session-transcript/<sessionId>/summary.md"),
     )
-    ap.add_argument("session", nargs="?",
-                    help="session id; omit to list this project's sessions")
+    ap.add_argument("sessions", nargs="*", metavar="session",
+                    help="session id(s); omit to list this project's sessions")
     ap.add_argument("--out", metavar="FILE",
                     help="write the transcript here instead of the default path")
     ap.add_argument("--tools", dest="tools", action="store_true", default=True,
@@ -990,29 +992,38 @@ def main() -> None:
                     help="also print the transcript to stdout")
     args = ap.parse_args()
 
-    if not args.session:
+    if not args.sessions:
         print_session_list()
         return
+    if args.out and len(args.sessions) > 1:
+        ap.error("--out names a single file; drop it when passing several ids")
 
-    path, provider = find_session_file(args.session)
-    records = load_records(path)
-    session_id = canonical_session_id(records, path, provider)
-    transcript = build_transcript(records, session_id, args.tools, provider)
+    # Resolve every id before writing anything so a missing/ambiguous id fails
+    # the whole run up front instead of leaving a partial set of transcripts.
+    resolved = [find_session_file(session) for session in args.sessions]
 
     # Why a file instead of just printing the transcript to stdout for the
     # invoking agent to consume: a full transcript can be large, and tool
     # stdout is truncated at the agent's output cap (and would dump the whole
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
-    out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(transcript, encoding="utf-8")
+    out_paths: list[Path] = []
+    for path, provider in resolved:
+        records = load_records(path)
+        session_id = canonical_session_id(records, path, provider)
+        transcript = build_transcript(records, session_id, args.tools, provider)
+        out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(transcript, encoding="utf-8")
+        if args.stdout:
+            print(transcript)
+            print("\n---", file=sys.stderr)
+        out_paths.append(out)
 
-    if args.stdout:
-        print(transcript)
-        print("\n---", file=sys.stderr)
-    # Machine-readable last line: the path the skill should read.
-    print(out)
+    # Machine-readable last lines: one transcript path per session, in
+    # argument order — the paths the skill should read.
+    for out in out_paths:
+        print(out)
 
 
 if __name__ == "__main__":
