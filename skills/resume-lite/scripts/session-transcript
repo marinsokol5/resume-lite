@@ -5,7 +5,8 @@ session-transcript
 Parse a Claude Code or Codex session JSONL and emit a *light* markdown transcript:
 just the human <-> assistant back-and-forth, with a compact note of which
 tools ran and what they touched (files read/edited, URLs fetched, ...).
-No LLM, no tokens, ~instant.
+Plan-mode plans (Claude's ExitPlanMode, Codex's proposed plan) get their own
+`## 📋 Plan` sections. No LLM, no tokens, ~instant.
 
 Two modes:
     convo+tools (default) — user <-> assistant text + a `🔧 tools:` trace
@@ -736,9 +737,13 @@ def codex_tool_labels(payload: dict) -> list[str]:
     return []
 
 
-def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
-    """Return (text_blocks, tool_labels) from an assistant message."""
-    texts, tools = [], []
+def assistant_parts(msg: dict) -> tuple[list[str], list[str], list[str]]:
+    """Return (text_blocks, tool_labels, plans) from an assistant message.
+
+    Plan-mode plans exist only inside the ExitPlanMode tool_use input — no
+    text block carries them — so they'd vanish behind a bare tool label.
+    """
+    texts, tools, plans = [], [], []
     content = msg.get("content")
     if isinstance(content, str):
         if content.strip():
@@ -751,8 +756,24 @@ def assistant_parts(msg: dict) -> tuple[list[str], list[str]]:
             if t == "text" and b.get("text", "").strip():
                 texts.append(b["text"].strip())
             elif t == "tool_use":
-                tools.append(tool_label(b.get("name", "tool"), b.get("input")))
-    return texts, tools
+                plan = (b.get("input") or {}).get("plan") \
+                    if b.get("name") == "ExitPlanMode" else None
+                if isinstance(plan, str) and plan.strip():
+                    plans.append(plan.strip())
+                else:
+                    tools.append(tool_label(b.get("name", "tool"), b.get("input")))
+    return texts, tools, plans
+
+
+# Codex plan mode delivers the plan as one assistant message wrapped in these
+# tags (the item_completed Plan event repeats it, but only in newer rollouts).
+_PROPOSED_PLAN_RE = re.compile(r"\A<proposed_plan>\s*(.*?)\s*</proposed_plan>\Z",
+                               re.DOTALL)
+
+
+def _codex_plan_text(text: str) -> str | None:
+    m = _PROPOSED_PLAN_RE.match(text.strip())
+    return m.group(1) if m else None
 
 
 def _codex_message_text(payload: dict) -> str | None:
@@ -768,7 +789,7 @@ def _codex_message_text(payload: dict) -> str | None:
 
 
 def normalized_events(records: list[dict], provider: str):
-    """Yield (user|assistant|tool, text) events from either provider."""
+    """Yield (user|assistant|plan|tool, text) events from either provider."""
     if provider == "claude":
         for r in records:
             if r.get("isSidechain") or r.get("isMeta"):
@@ -781,16 +802,26 @@ def normalized_events(records: list[dict], provider: str):
                 if text is not None:
                     yield "user", text
             elif typ == "assistant":
-                texts, tools = assistant_parts(msg)
+                texts, tools, plans = assistant_parts(msg)
                 for label in tools:
                     yield "tool", label
                 for text in texts:
                     yield "assistant", text
+                for plan in plans:
+                    yield "plan", plan
         return
 
     event_types = {r.get("payload", {}).get("type") for r in records
                    if r.get("type") == "event_msg"
                    and isinstance(r.get("payload"), dict)}
+    # Assistant response_items are deduped against agent_message *texts*, not
+    # just the event type: plan-mode's final plan has no agent_message twin,
+    # and an event-type check would swallow it along with the duplicates.
+    agent_texts = {r["payload"]["message"].strip() for r in records
+                   if r.get("type") == "event_msg"
+                   and isinstance(r.get("payload"), dict)
+                   and r["payload"].get("type") == "agent_message"
+                   and isinstance(r["payload"].get("message"), str)}
     for r in records:
         payload = r.get("payload")
         if not isinstance(payload, dict):
@@ -802,14 +833,16 @@ def normalized_events(records: list[dict], provider: str):
             if typ == "user_message":
                 yield "user", text.strip()
             elif typ == "agent_message":
-                yield "assistant", text.strip()
+                plan = _codex_plan_text(text)
+                yield ("plan", plan) if plan else ("assistant", text.strip())
         elif r.get("type") == "response_item":
             if payload.get("type") == "message":
                 role, text = payload.get("role"), _codex_message_text(payload)
                 if role == "user" and "user_message" not in event_types and text:
                     yield "user", text
-                elif role == "assistant" and "agent_message" not in event_types and text:
-                    yield "assistant", text
+                elif role == "assistant" and text and text not in agent_texts:
+                    plan = _codex_plan_text(text)
+                    yield ("plan", plan) if plan else ("assistant", text)
             for label in codex_tool_labels(payload):
                 yield "tool", label
 
@@ -883,6 +916,9 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
         elif typ == "assistant":
             flush_tools()
             lines.append(f"## 🤖 {assistant_name}\n\n{value}\n")
+        elif typ == "plan":
+            flush_tools()
+            lines.append(f"## 📋 Plan ({assistant_name})\n\n{value}\n")
         elif typ == "tool":
             pending_tools.append(value)
     flush_tools()
@@ -893,9 +929,9 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
         "",
         f"_Source: {source} · Project: `{cwd}` · {exchanges} user turns · {span}_",
         "",
-        "> Light transcript (human ↔ assistant text; each tool call noted with its "
-        "target when available — tool *outputs* and thinking omitted). Read it to "
-        "recover where we left off, then continue the work.",
+        "> Light transcript (human ↔ assistant text and plan-mode plans; each tool "
+        "call noted with its target when available — tool *outputs* and thinking "
+        "omitted). Read it to recover where we left off, then continue the work.",
         "",
         "---",
         "",
