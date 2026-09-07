@@ -50,6 +50,15 @@ given, each session under its own heading — one conversation continued across
 sessions stays one thing to read (written to
 `$TMPDIR/session-transcript/<id1+id2+...>/combined.md`).
 
+Or **keep** a session instead of resuming it — `--save` writes the transcript
+into the project, named to be recognizable in a repo listing, so it can be
+committed alongside the work it describes:
+
+```
+/resume-lite <sessionId> --save
+# transcripts/2026-09-07-support-multiple-session-ids-48f4b8ff.md
+```
+
 Or run the parser directly:
 
 ```shell
@@ -57,7 +66,7 @@ skills/resume-lite/scripts/session-transcript <sessionId> [<sessionId> ...]   # 
 ```
 
 Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
-`--out <file>` (override the path).
+`--save` (keep it in `transcripts/`), `--out <file>` (override the path).
 
 
 ## How it works

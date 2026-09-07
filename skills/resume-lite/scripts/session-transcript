@@ -16,6 +16,7 @@ Two modes:
 Usage:
     session-transcript                        # list this project's sessions, then exit
     session-transcript <sessionId> [...]      # write ONE transcript file
+        [--save]                 # keep it in the project (see below)
         [--out <file>]           # override output path
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
@@ -28,9 +29,13 @@ Several ids are stitched into a single file, in the order given, each session
 under its own heading — one conversation continued across sessions stays one
 thing to read.
 
-Default output:
+Default output is throwaway, under the OS temp dir:
     $TMPDIR/session-transcript/<sessionId>/summary.md    # one id
     $TMPDIR/session-transcript/<id1+id2+.../combined.md  # several ids
+
+--save instead writes a keepable transcript into the project, named to be
+recognizable in a repo listing (and committed):
+    transcripts/<date>-<opening prompt>-<id8>.md
 
 The output file path is printed to stdout as the last line.
 """
@@ -54,6 +59,9 @@ CODEX_SESSION_DIRS = (CODEX_HOME / "sessions", CODEX_HOME / "archived_sessions")
 # Default under the OS temp dir (honors $TMPDIR) so it's writable even under
 # Claude Code's Bash sandbox, which blocks arbitrary /tmp paths.
 OUT_ROOT = Path(tempfile.gettempdir()) / "session-transcript"
+# --save writes here instead, relative to the project dir the script is run
+# from, so the transcript can be committed alongside the work it describes.
+SAVE_DIR = "transcripts"
 
 # Text blocks that are harness plumbing, not real conversation.
 _SKIP_PREFIXES = ("<command-name>", "<local-command-stdout>", "<command-message>")
@@ -1038,6 +1046,39 @@ def combined_out_path(session_ids: list[str]) -> Path:
     return OUT_ROOT / name / "combined.md"
 
 
+def _slugify(text: str, limit: int = 48) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    if len(slug) <= limit:
+        return slug
+    return slug[:limit].rsplit("-", 1)[0] or slug[:limit]  # don't end mid-word
+
+
+def _local_date(stamp: str) -> str:
+    try:
+        return (datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                .astimezone().strftime("%Y-%m-%d"))
+    except ValueError:
+        return stamp[:10]
+
+
+def save_out_path(path: Path, provider: str, records: list[dict],
+                  session_id: str, extra: int) -> Path:
+    """In-project path for a transcript worth keeping (and committing).
+
+    Named for a human scanning a repo listing, not for a machine: the date and
+    the opening prompt are what you recognize it by months later. The short id
+    keeps two same-day sessions apart and maps the file back to its session.
+    """
+    stamps = _timestamps(records)
+    date = (_local_date(stamps[0]) if stamps else
+            datetime.date.fromtimestamp(path.stat().st_mtime).isoformat())
+    slug = _slugify(first_user_snippet(path, provider, limit=120)) or "session"
+    name = f"{date}-{slug}-{session_id[:8]}"
+    if extra:
+        name += f"+{extra}more"
+    return Path(SAVE_DIR) / f"{name}.md"
+
+
 def print_session_list() -> None:
     """No session id given: list this project's sessions so one can be chosen."""
     cwd = os.getcwd()  # sessions are scoped to this directory; name it so a
@@ -1076,14 +1117,20 @@ def main() -> None:
             "Several ids are stitched into a single transcript, in the order "
             "given,\neach session under its own heading.\n\n"
             "The transcript file path is printed as the LAST stdout line "
-            "(read that\nfile). Default location:\n"
+            "(read that\nfile). Default location is throwaway:\n"
             "  $TMPDIR/session-transcript/<sessionId>/summary.md    (one id)\n"
-            "  $TMPDIR/session-transcript/<id1+id2+...>/combined.md (several)"),
+            "  $TMPDIR/session-transcript/<id1+id2+...>/combined.md (several)\n\n"
+            "--save keeps it in the project instead, under a name you can "
+            "recognize\nin a repo listing:\n"
+            "  transcripts/<date>-<opening prompt>-<id8>.md"),
     )
     ap.add_argument("sessions", nargs="*", metavar="session",
                     help="session id(s); omit to list this project's sessions")
-    ap.add_argument("--out", metavar="FILE",
-                    help="write the transcript here instead of the default path")
+    where = ap.add_mutually_exclusive_group()
+    where.add_argument("--out", metavar="FILE",
+                       help="write the transcript here instead of the default path")
+    where.add_argument("--save", action="store_true",
+                       help=f"keep it in the project: {SAVE_DIR}/<date>-<topic>-<id>.md")
     ap.add_argument("--tools", dest="tools", action="store_true", default=True,
                     help="include the 🔧 tools trace (default)")
     ap.add_argument("--no-tools", dest="tools", action="store_false",
@@ -1127,7 +1174,12 @@ def main() -> None:
     # stdout is truncated at the agent's output cap (and would dump the whole
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
-    out = Path(args.out) if args.out else default_out
+    if args.save:
+        first_path, first_provider = resolved[0]
+        out = save_out_path(first_path, first_provider, loaded[0][0],
+                            loaded[0][1], len(loaded) - 1)
+    else:
+        out = Path(args.out) if args.out else default_out
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(transcript, encoding="utf-8")
     if args.stdout:
