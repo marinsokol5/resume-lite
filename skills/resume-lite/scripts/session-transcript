@@ -37,7 +37,7 @@ newest chat and get the whole conversation, rendered oldest-first.
 
 Default output is throwaway, under the OS temp dir:
     $TMPDIR/session-transcript/<sessionId>/summary.md    # one id
-    $TMPDIR/session-transcript/<id1+id2+.../combined.md  # several ids
+    $TMPDIR/session-transcript/<id1+id2+...>-<hash>/combined.md  # several ids
 
 --save instead writes a keepable transcript into the project, named to be
 recognizable in a repo listing (and committed):
@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import glob
+import hashlib
 import json
 import os
 import re
@@ -939,13 +940,27 @@ _LINEAGE_PATTERNS = (
     # Claude Code files a slash command's arguments in their own block.
     re.compile(r"<command-name>\s*/resume-lite\s*</command-name>\s*"
                r"<command-args>([^<]*)</command-args>"),
-    # Typed plainly (Codex `$resume-lite <id>`): the rest of that line is args.
-    re.compile(r"[/$]resume-lite\b([^\n]*)"),
+    # Typed plainly (Codex `$resume-lite <id>`). Require a standalone command,
+    # not the name inside /path/to/resume-lite/SKILL.md, and stop at the next
+    # shell command just as we do for the script invocation below.
+    re.compile(r"(?<![\w/.$-])[/$]resume-lite(?=[ \t]|$)([^\n|;&]*)"),
     # The invocation the skill runs: ids are arguments of that one command.
-    re.compile(r"session-transcript(?![/\w-])([^\n|;&]{0,120})"),
+    re.compile(r"(?<![\w-])session-transcript[\"']?[ \t]+([^\n|;&]*)"),
     # And the read of what it produced.
     re.compile(r"session-transcript/([0-9a-fA-F-]{36})/"),
 )
+
+
+def _string_values(value):
+    """Strings in a structured tool input, without JSON escaping or siblings."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for item in value.values():
+            yield from _string_values(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _string_values(item)
 
 
 def _lineage_strings(record: dict, provider: str):
@@ -972,9 +987,7 @@ def _lineage_strings(record: dict, provider: str):
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
-                for value in (block.get("input") or {}).values():
-                    if isinstance(value, str):
-                        yield value
+                yield from _string_values(block.get("input"))
         return
 
     payload = record.get("payload")
@@ -989,8 +1002,17 @@ def _lineage_strings(record: dict, provider: str):
         if text:
             yield text
     for key in ("input", "arguments", "command"):  # custom_tool_call / function_call
-        if isinstance(payload.get(key), str):
-            yield payload[key]
+        value = payload.get(key)
+        if isinstance(value, str):
+            # Function-call arguments are JSON: parse before matching so a
+            # command's escaped newline ends its arguments, and unrelated
+            # input fields cannot supply an extra parent id.
+            if key == "arguments":
+                try:
+                    value = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+            yield from _string_values(value)
 
 
 def lineage_ids(session: Session) -> list[str]:
@@ -1221,13 +1243,19 @@ def build_combined(sessions: list[Session], show_tools: bool,
     return "\n".join(out)
 
 
+def _session_ids_hash(session_ids: list[str]) -> str:
+    """Stable identity for all full ids, including their transcript order."""
+    encoded = json.dumps(session_ids, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
 def combined_out_path(session_ids: list[str]) -> Path:
     """Default path for a stitched transcript: named after the ids it holds."""
     shorts = [sid[:8] for sid in session_ids]
     name = "+".join(shorts[:4])
     if len(shorts) > 4:
         name += f"+{len(shorts) - 4}more"
-    return OUT_ROOT / name / "combined.md"
+    return OUT_ROOT / f"{name}-{_session_ids_hash(session_ids)}" / "combined.md"
 
 
 def _slugify(text: str, limit: int = 48) -> str:
@@ -1245,13 +1273,14 @@ def _local_date(stamp: str) -> str:
         return stamp[:10]
 
 
-def save_out_path(session: Session, extra: int) -> Path:
+def save_out_path(sessions: list[Session]) -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
     Named for a human scanning a repo listing, not for a machine: the date and
     the opening prompt are what you recognize it by months later. The short id
     keeps two same-day sessions apart and maps the file back to its session.
     """
+    session = sessions[0]
     stamps = _timestamps(session.records)
     date = (_local_date(stamps[0]) if stamps else
             datetime.date.fromtimestamp(session.path.stat().st_mtime).isoformat())
@@ -1259,8 +1288,9 @@ def save_out_path(session: Session, extra: int) -> Path:
                                skip_commands=True)
     slug = _slugify(_SESSION_ID_RE.sub(" ", topic)) or "session"
     name = f"{date}-{slug}-{session.id[:8]}"
-    if extra:
-        name += f"+{extra}more"
+    if len(sessions) > 1:
+        name += (f"+{len(sessions) - 1}more-"
+                 f"{_session_ids_hash([s.id for s in sessions])}")
     return Path(SAVE_DIR) / f"{name}.md"
 
 
@@ -1306,7 +1336,7 @@ def main() -> None:
             "The transcript file path is printed as the LAST stdout line "
             "(read that\nfile). Default location is throwaway:\n"
             "  $TMPDIR/session-transcript/<sessionId>/summary.md    (one id)\n"
-            "  $TMPDIR/session-transcript/<id1+id2+...>/combined.md (several)\n\n"
+            "  $TMPDIR/session-transcript/<id1+id2+...>-<hash>/combined.md (several)\n\n"
             "--save keeps it in the project instead, under a name you can "
             "recognize\nin a repo listing:\n"
             "  transcripts/<date>-<opening prompt>-<id8>.md"),
@@ -1339,7 +1369,8 @@ def main() -> None:
     # by path) would only repeat a section.
     resolved: list[tuple[Path, str]] = []
     for session in args.sessions:
-        found = find_session_file(session)
+        path, provider = find_session_file(session)
+        found = (path.resolve(), provider)
         if found not in resolved:
             resolved.append(found)
 
@@ -1371,7 +1402,7 @@ def main() -> None:
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
     if args.save:
-        out = save_out_path(sessions[0], len(sessions) - 1)
+        out = save_out_path(sessions)
     else:
         out = Path(args.out) if args.out else default_out
     out.parent.mkdir(parents=True, exist_ok=True)

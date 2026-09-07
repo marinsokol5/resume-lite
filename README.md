@@ -48,7 +48,8 @@ short orientation.
 Pass several ids and they're stitched into a **single** file, in the order
 given, each session under its own heading — one conversation continued across
 sessions stays one thing to read (written to
-`$TMPDIR/session-transcript/<id1+id2+...>/combined.md`).
+`$TMPDIR/session-transcript/<id1+id2+...>-<hash>/combined.md`). The hash covers
+all full session ids in transcript order, so different combinations stay separate.
 
 If that session was itself resumed from an earlier one, `--deep` walks the
 chain back — transitively, and across providers — and lays it out oldest-first
@@ -70,6 +71,9 @@ committed alongside the work it describes:
 /resume-lite <sessionId> --save
 # transcripts/2026-09-07-support-multiple-session-ids-48f4b8ff.md
 ```
+
+For several sessions, saved names also include `+<count>more-<hash>` so saving
+another combination with the same opening session preserves the earlier file.
 
 Or run the parser directly:
 
