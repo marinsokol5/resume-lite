@@ -2,7 +2,7 @@
 """
 session-transcript
 
-Parse a Claude Code or Codex session JSONL and emit a *light* markdown transcript:
+Parse Claude Code or Codex session JSONLs and emit a *light* markdown transcript:
 just the human <-> assistant back-and-forth, with a compact note of which
 tools ran and what they touched (files read/edited, URLs fetched, ...).
 Plan-mode plans (Claude's ExitPlanMode, Codex's proposed plan) get their own
@@ -15,20 +15,24 @@ Two modes:
 
 Usage:
     session-transcript                        # list this project's sessions, then exit
-    session-transcript <sessionId> [...]      # write a transcript per session
-        [--out <file>]           # override output path (single session only)
+    session-transcript <sessionId> [...]      # write ONE transcript file
+        [--out <file>]           # override output path
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
-        [--stdout]               # also print the transcript(s) to stdout
+        [--stdout]               # also print the transcript to stdout
 
 Sessions are scoped to the current directory. Pass no argument to list Claude
 Code and Codex sessions together (provider · id · time · first prompt); re-run
 with a chosen id. With an id, the storage location determines the provider.
 
-Default output:
-    $TMPDIR/session-transcript/<sessionId>/summary.md
+Several ids are stitched into a single file, in the order given, each session
+under its own heading — one conversation continued across sessions stays one
+thing to read.
 
-With session ids, the output file paths are printed to stdout (last lines,
-one per session, in argument order).
+Default output:
+    $TMPDIR/session-transcript/<sessionId>/summary.md    # one id
+    $TMPDIR/session-transcript/<id1+id2+.../combined.md  # several ids
+
+The output file path is printed to stdout as the last line.
 """
 
 from __future__ import annotations
@@ -891,12 +895,30 @@ def _compact_tool_labels(labels: list[str]) -> list[str]:
     return compact
 
 
-def build_transcript(records: list[dict], session_id: str, show_tools: bool,
-                     provider: str) -> str:
-    cwd = _session_cwd(records, provider)
-    timestamps = [r.get("timestamp") for r in records if r.get("timestamp")]
-    span = f"{timestamps[0]} → {timestamps[-1]}" if timestamps else ""
+BLURB = ("> Light transcript (human ↔ assistant text and plan-mode plans; each tool "
+         "call noted with its target when available — tool *outputs* and thinking "
+         "omitted). Read it to recover where we left off, then continue the work.")
 
+
+def _source_name(provider: str) -> str:
+    return "Claude Code" if provider == "claude" else "Codex"
+
+
+def _turns(count: int) -> str:
+    return f"{count} user turn" + ("" if count == 1 else "s")
+
+
+def _timestamps(records: list[dict]) -> list[str]:
+    return [r.get("timestamp") for r in records if r.get("timestamp")]
+
+
+def _span(timestamps: list[str]) -> str:
+    return f"{timestamps[0]} → {timestamps[-1]}" if timestamps else ""
+
+
+def _transcript_body(records: list[dict], show_tools: bool,
+                     provider: str) -> tuple[str, int]:
+    """Render the turns of one session; returns (markdown, user-turn count)."""
     # Turns: list of ("user"|"assistant", text) plus pending tool names.
     lines: list[str] = []
     exchanges = 0
@@ -923,21 +945,97 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
         elif typ == "tool":
             pending_tools.append(value)
     flush_tools()
+    return "\n".join(lines), exchanges
 
-    source = "Claude Code" if provider == "claude" else "Codex"
+
+def _meta_line(records: list[dict], provider: str, exchanges: int) -> str:
+    cwd = _session_cwd(records, provider)
+    return (f"_Source: {_source_name(provider)} · Project: `{cwd}` · "
+            f"{_turns(exchanges)} · {_span(_timestamps(records))}_")
+
+
+def build_transcript(records: list[dict], session_id: str, show_tools: bool,
+                     provider: str) -> str:
+    body, exchanges = _transcript_body(records, show_tools, provider)
     header = [
         f"# Session transcript — `{session_id}`",
         "",
-        f"_Source: {source} · Project: `{cwd}` · {exchanges} user turns · {span}_",
+        _meta_line(records, provider, exchanges),
         "",
-        "> Light transcript (human ↔ assistant text and plan-mode plans; each tool "
-        "call noted with its target when available — tool *outputs* and thinking "
-        "omitted). Read it to recover where we left off, then continue the work.",
+        BLURB,
         "",
         "---",
         "",
     ]
-    return "\n".join(header) + "\n".join(lines)
+    return "\n".join(header) + body
+
+
+def build_combined(sessions: list[tuple[list[dict], str, str]],
+                   show_tools: bool) -> str:
+    """Stitch several sessions into one document, in the order given.
+
+    Several ids are usually one conversation continued across sessions, so the
+    reader wants a single file to page through rather than N of them: a shared
+    header and index up front, then each session under its own `#` heading with
+    the turn headings (`##`) unchanged.
+    """
+    parts = []
+    for records, session_id, provider in sessions:
+        body, exchanges = _transcript_body(records, show_tools, provider)
+        parts.append({
+            "id": session_id,
+            "provider": provider,
+            "cwd": _session_cwd(records, provider),
+            "stamps": _timestamps(records),
+            "turns": exchanges,
+            "body": body,
+        })
+
+    total = len(parts)
+    cwd = next((p["cwd"] for p in parts if p["cwd"]), "")
+    turns = sum(p["turns"] for p in parts)
+    # Overall span from every timestamp, since the ids may be given newest-first.
+    stamps = sorted(s for p in parts for s in p["stamps"])
+    span = _span([stamps[0], stamps[-1]]) if stamps else ""
+    sources = ", ".join(dict.fromkeys(_source_name(p["provider"]) for p in parts))
+
+    out = [
+        f"# Session transcript — {total} sessions combined",
+        "",
+        f"_Source: {sources} · Project: `{cwd}` · {_turns(turns)} "
+        f"across {total} sessions · {span}_",
+        "",
+        BLURB,
+        "",
+        "Sessions below, in the order they were given:",
+        "",
+    ]
+    for i, p in enumerate(parts, 1):
+        out.append(f"{i}. `{p['id']}` — {_source_name(p['provider'])} · "
+                   f"{_turns(p['turns'])} · {_span(p['stamps'])}")
+    out.append("")
+
+    for i, p in enumerate(parts, 1):
+        out += [
+            "---",
+            "",
+            f"# Session {i} of {total} — `{p['id']}`",
+            "",
+            f"_Source: {_source_name(p['provider'])} · Project: `{p['cwd']}` · "
+            f"{_turns(p['turns'])} · {_span(p['stamps'])}_",
+            "",
+            p["body"],
+        ]
+    return "\n".join(out)
+
+
+def combined_out_path(session_ids: list[str]) -> Path:
+    """Default path for a stitched transcript: named after the ids it holds."""
+    shorts = [sid[:8] for sid in session_ids]
+    name = "+".join(shorts[:4])
+    if len(shorts) > 4:
+        name += f"+{len(shorts) - 4}more"
+    return OUT_ROOT / name / "combined.md"
 
 
 def print_session_list() -> None:
@@ -970,15 +1068,17 @@ def main() -> None:
             "modes:\n"
             "  session-transcript                       list this project's "
             "sessions, then exit\n"
-            "  session-transcript <sessionId> [...]     write a transcript "
-            "per session\n\n"
+            "  session-transcript <sessionId> [...]     write ONE transcript "
+            "file\n\n"
             "Sessions are scoped to the current directory. Lookup by id "
             "searches the\nClaude Code and Codex stores; the matching store "
             "selects the provider.\n\n"
-            "With ids, the transcript file paths are printed as the LAST "
-            "stdout lines,\none per session in argument order (read those "
-            "files). Default location:\n"
-            "  $TMPDIR/session-transcript/<sessionId>/summary.md"),
+            "Several ids are stitched into a single transcript, in the order "
+            "given,\neach session under its own heading.\n\n"
+            "The transcript file path is printed as the LAST stdout line "
+            "(read that\nfile). Default location:\n"
+            "  $TMPDIR/session-transcript/<sessionId>/summary.md    (one id)\n"
+            "  $TMPDIR/session-transcript/<id1+id2+...>/combined.md (several)"),
     )
     ap.add_argument("sessions", nargs="*", metavar="session",
                     help="session id(s); omit to list this project's sessions")
@@ -995,35 +1095,47 @@ def main() -> None:
     if not args.sessions:
         print_session_list()
         return
-    if args.out and len(args.sessions) > 1:
-        ap.error("--out names a single file; drop it when passing several ids")
 
     # Resolve every id before writing anything so a missing/ambiguous id fails
-    # the whole run up front instead of leaving a partial set of transcripts.
-    resolved = [find_session_file(session) for session in args.sessions]
+    # the whole run up front instead of leaving a half-written transcript.
+    # Dedupe on the resolved file: the same session named twice (say a prefix
+    # and its full id) would only repeat a section.
+    resolved: list[tuple[Path, str]] = []
+    for session in args.sessions:
+        found = find_session_file(session)
+        if found not in resolved:
+            resolved.append(found)
+
+    loaded = []
+    for path, provider in resolved:
+        records = load_records(path)
+        loaded.append((records, canonical_session_id(records, path, provider), provider))
+
+    if len(loaded) == 1:
+        records, session_id, provider = loaded[0]
+        transcript = build_transcript(records, session_id, args.tools, provider)
+        default_out = OUT_ROOT / session_id / "summary.md"
+    else:
+        # Several ids -> one stitched file, in argument order: the caller is
+        # picking up one conversation spread over sessions, so it should end up
+        # as one thing to read, not N.
+        transcript = build_combined(loaded, args.tools)
+        default_out = combined_out_path([s[1] for s in loaded])
 
     # Why a file instead of just printing the transcript to stdout for the
     # invoking agent to consume: a full transcript can be large, and tool
     # stdout is truncated at the agent's output cap (and would dump the whole
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
-    out_paths: list[Path] = []
-    for path, provider in resolved:
-        records = load_records(path)
-        session_id = canonical_session_id(records, path, provider)
-        transcript = build_transcript(records, session_id, args.tools, provider)
-        out = Path(args.out) if args.out else OUT_ROOT / session_id / "summary.md"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(transcript, encoding="utf-8")
-        if args.stdout:
-            print(transcript)
-            print("\n---", file=sys.stderr)
-        out_paths.append(out)
+    out = Path(args.out) if args.out else default_out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(transcript, encoding="utf-8")
+    if args.stdout:
+        print(transcript)
+        print("\n---", file=sys.stderr)
 
-    # Machine-readable last lines: one transcript path per session, in
-    # argument order — the paths the skill should read.
-    for out in out_paths:
-        print(out)
+    # Machine-readable last line: the transcript path the skill should read.
+    print(out)
 
 
 if __name__ == "__main__":

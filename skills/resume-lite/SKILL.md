@@ -21,11 +21,12 @@ since it scopes sessions to the working directory.
    guess. 
    1. **With session id(s)** (from `$ARGUMENTS` or the user's choice) run
    `python3 scripts/session-transcript "<id>" ["<id>" ...]` — pass all ids in
-   one invocation. It writes one transcript per session and prints their file
-   paths as the **last stdout lines**, one per session in argument order. On a
-   missing/ambiguous id it exits non-zero with the reason — relay that and ask
-   the user to confirm.
+   one invocation. It always writes **one** file (several ids are stitched into
+   a single transcript, in the order given) and prints its path as the **last
+   stdout line**. On a missing/ambiguous id it exits non-zero with the reason —
+   relay that and ask the user to confirm.
 
-2. **Read every created transcript**, then give a 2–3 line orientation per
-   session: what it was about, the last thing happening, and the obvious next
-   step. Then wait — don't auto-run anything.
+2. **Read the transcript file**, then give a 2–3 line orientation — what it was
+   about, the last thing happening, and the obvious next step; one such
+   orientation per session when it holds several. Then wait — don't auto-run
+   anything.

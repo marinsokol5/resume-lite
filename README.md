@@ -38,17 +38,22 @@ npx skills update resume-lite
 As a skill (`/resume-lite` in Claude Code, `$resume-lite` in Codex):
 
 ```
-/resume-lite <sessionId>
+/resume-lite <sessionId> [<sessionId> ...]
 ```
 
 It runs the bundled `session-transcript` parser, writes the transcript to
 `$TMPDIR/session-transcript/<sessionId>/summary.md`, reads it back, and gives a
 short orientation.
 
+Pass several ids and they're stitched into a **single** file, in the order
+given, each session under its own heading — one conversation continued across
+sessions stays one thing to read (written to
+`$TMPDIR/session-transcript/<id1+id2+...>/combined.md`).
+
 Or run the parser directly:
 
 ```shell
-skills/resume-lite/scripts/session-transcript <sessionId>   # write the transcript, print its path
+skills/resume-lite/scripts/session-transcript <sessionId> [<sessionId> ...]   # write the transcript, print its path
 ```
 
 Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
