@@ -16,6 +16,7 @@ Two modes:
 Usage:
     session-transcript                        # list this project's sessions, then exit
     session-transcript <sessionId> [...]      # write ONE transcript file
+        [--deep]                 # also include what these resumed from
         [--save]                 # keep it in the project (see below)
         [--out <file>]           # override output path
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
@@ -28,6 +29,11 @@ with a chosen id. With an id, the storage location determines the provider.
 Several ids are stitched into a single file, in the order given, each session
 under its own heading — one conversation continued across sessions stays one
 thing to read.
+
+--deep finds those earlier sessions for you: a chat started with
+`/resume-lite <id>` (Codex: `$resume-lite <id>`) records where it came from, so
+the chain can be walked backwards, transitively and across providers. Name the
+newest chat and get the whole conversation, rendered oldest-first.
 
 Default output is throwaway, under the OS temp dir:
     $TMPDIR/session-transcript/<sessionId>/summary.md    # one id
@@ -52,6 +58,7 @@ import shlex
 import sys
 import tempfile
 from pathlib import Path
+from typing import NamedTuple
 
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CODEX_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
@@ -128,11 +135,15 @@ def _session_matches(path: Path, sid: str, provider: str) -> bool:
     return stem == sid or stem.endswith(f"-{sid}")
 
 
-def find_session_file(session: str) -> tuple[Path, str]:
-    """Locate a session by id and infer its provider from the matching store."""
+def session_hits(session: str) -> tuple[str, list[tuple[Path, str]]]:
+    """Every stored session matching an id (or path), with its provider.
+
+    Non-fatal: --deep walks ids found inside transcripts, where a dead or
+    ambiguous reference should be skipped rather than kill the whole run.
+    """
     supplied = Path(session).expanduser()
     if supplied.is_file():
-        return supplied, _detect_provider(supplied)
+        return supplied.name, [(supplied, _detect_provider(supplied))]
 
     sid = supplied.name
     if sid.endswith(".jsonl"):
@@ -157,6 +168,12 @@ def find_session_file(session: str) -> tuple[Path, str]:
         if key not in seen:
             seen.add(key)
             unique.append((path, provider))
+    return sid, unique
+
+
+def find_session_file(session: str) -> tuple[Path, str]:
+    """Locate a session by id and infer its provider from the matching store."""
+    sid, unique = session_hits(session)
     if not unique:
         roots = f"{CLAUDE_PROJECTS_DIR} or {CODEX_HOME / 'sessions'}"
         sys.exit(f"session '{sid}' not found under {roots}")
@@ -178,12 +195,20 @@ def _command_name(msg: dict) -> str | None:
     return m.group(1) if m else None
 
 
-def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
+# A user message that is only a command invocation, e.g. `$resume-lite <id>`.
+_INVOCATION_ONLY_RE = re.compile(r"\A[/$][A-Za-z0-9_.:-]+(?:\s+[0-9a-fA-F-]{6,36})*\Z")
+
+
+def first_user_snippet(path: Path, provider: str, limit: int = 72,
+                       skip_commands: bool = False) -> str:
     """First user prompt in a session, for the listing. Reads only until found.
 
     If the session opens with a slash command, surface its name (e.g.
-    `/resume-lite`) rather than skipping to a later typed prompt.
+    `/resume-lite`) rather than skipping to a later typed prompt — unless
+    skip_commands, where the caller wants what the session was *about* (naming
+    a file to keep), and `/resume-lite <id>` says nothing about that.
     """
+    fallback = ""
     try:
         for line in path.open(encoding="utf-8"):
             line = line.strip()
@@ -198,7 +223,10 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
                     and isinstance(r.get("message"), dict):
                 cmd = _command_name(r["message"])
                 if cmd:
-                    return cmd
+                    if not skip_commands:
+                        return cmd
+                    fallback = fallback or cmd
+                    continue
                 txt = user_text(r["message"])
                 if txt:
                     return _short(txt, limit)
@@ -207,10 +235,13 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72) -> str:
                     and isinstance(payload, dict) and payload.get("type") == "user_message":
                 txt = payload.get("message")
                 if isinstance(txt, str) and txt.strip():
+                    if skip_commands and _INVOCATION_ONLY_RE.match(txt.strip()):
+                        fallback = fallback or _short(txt, limit)
+                        continue
                     return _short(txt, limit)
     except OSError:
         pass
-    return ""
+    return fallback
 
 
 def _codex_meta(path: Path) -> dict:
@@ -881,6 +912,152 @@ def canonical_session_id(records: list[dict], path: Path, provider: str) -> str:
     return path.stem
 
 
+class Session(NamedTuple):
+    """A resolved session: where it lives, what it is, and its records."""
+    path: Path
+    provider: str
+    id: str
+    records: list[dict]
+
+
+def load_session(path: Path, provider: str) -> Session:
+    records = load_records(path)
+    return Session(path, provider,
+                   canonical_session_id(records, path, provider), records)
+
+
+# A session records where it was resumed from in three shapes: the human's
+# `/resume-lite <id>` (Codex: `$resume-lite <id>`), the script invocation the
+# skill then runs, and the read of the transcript it produced. So match those
+# fields specifically. A blind grep for the skill's name would hit every session
+# on disk, since its description sits in every system prompt that lists skills.
+_SESSION_ID_RE = re.compile(
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+# Each pattern captures the region an id can legitimately sit in, so an
+# unrelated id elsewhere in the same long prompt or command can't ride along.
+_LINEAGE_PATTERNS = (
+    # Claude Code files a slash command's arguments in their own block.
+    re.compile(r"<command-name>\s*/resume-lite\s*</command-name>\s*"
+               r"<command-args>([^<]*)</command-args>"),
+    # Typed plainly (Codex `$resume-lite <id>`): the rest of that line is args.
+    re.compile(r"[/$]resume-lite\b([^\n]*)"),
+    # The invocation the skill runs: ids are arguments of that one command.
+    re.compile(r"session-transcript(?![/\w-])([^\n|;&]{0,120})"),
+    # And the read of what it produced.
+    re.compile(r"session-transcript/([0-9a-fA-F-]{36})/"),
+)
+
+
+def _lineage_strings(record: dict, provider: str):
+    """Fields of one record that could name a session it was resumed from.
+
+    User prompts and tool *inputs* only: assistant prose merely discussing a
+    session isn't a resume, and tool outputs replay ids from the transcripts
+    they just read.
+    """
+    if provider == "claude":
+        message = record.get("message")
+        if not isinstance(message, dict):
+            return
+        content = message.get("content")
+        if record.get("type") == "user":
+            if isinstance(content, str):
+                yield content
+            elif isinstance(content, list):
+                for block in content:  # text blocks only: a tool_result keeps
+                    if isinstance(block, dict) \
+                            and isinstance(block.get("text"), str):
+                        yield block["text"]  # its payload under "content"
+        elif record.get("type") == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                for value in (block.get("input") or {}).values():
+                    if isinstance(value, str):
+                        yield value
+        return
+
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return
+    # user_message, not agent_message: the assistant merely discussing a
+    # session is not a resume.
+    if payload.get("type") == "user_message" and isinstance(payload.get("message"), str):
+        yield payload["message"]
+    if payload.get("type") == "message" and payload.get("role") == "user":
+        text = _codex_message_text(payload)
+        if text:
+            yield text
+    for key in ("input", "arguments", "command"):  # custom_tool_call / function_call
+        if isinstance(payload.get(key), str):
+            yield payload[key]
+
+
+def lineage_ids(session: Session) -> list[str]:
+    """Session ids this session was resumed from, in the order they appear."""
+    found: list[str] = []
+    for record in session.records:
+        for text in _lineage_strings(record, session.provider):
+            for pattern in _LINEAGE_PATTERNS:
+                for match in pattern.finditer(text):
+                    for sid in _SESSION_ID_RE.findall(match.group(1)):
+                        sid = sid.lower()
+                        if sid != session.id.lower() and sid not in found:
+                            found.append(sid)
+    return found
+
+
+def follow_lineage(seeds: list[Session]) -> tuple[list[Session], dict[str, list[str]]]:
+    """Pull in the sessions the seeds were resumed from, transitively.
+
+    Discovery runs backwards (you hold the newest chat and learn its parent by
+    reading it) but that never reaches the caller: the walk only collects a
+    set — a visited set keeps a chain that loops, or two chats resumed from one
+    parent, from spinning — and the caller then sorts it into reading order.
+    """
+    sessions = list(seeds)
+    by_path = {s.path.resolve(): s for s in sessions}
+    parents: dict[str, list[str]] = {}
+    queue = list(sessions)
+    while queue:
+        session = queue.pop(0)
+        for sid in lineage_ids(session):
+            _, hits = session_hits(sid)
+            if len(hits) != 1:
+                reason = "ambiguous" if hits else "not found"
+                print(f"--deep: {session.id[:8]} references {sid[:8]} "
+                      f"({reason}, skipped)", file=sys.stderr)
+                continue
+            key = hits[0][0].resolve()
+            parent = by_path.get(key)
+            if parent is None:
+                parent = load_session(*hits[0])
+                by_path[key] = parent
+                sessions.append(parent)
+                queue.append(parent)
+            if parent.id == session.id:
+                continue
+            print(f"--deep: {session.id[:8]} resumed from {parent.id[:8]}",
+                  file=sys.stderr)
+            if parent.id not in parents.setdefault(session.id, []):
+                parents[session.id].append(parent.id)
+    return sessions, parents
+
+
+def session_start(session: Session) -> datetime.datetime:
+    """When the session began — the sort key that puts a chain in order."""
+    stamps = _timestamps(session.records)
+    if stamps:
+        try:
+            started = datetime.datetime.fromisoformat(stamps[0].replace("Z", "+00:00"))
+            return started if started.tzinfo else started.replace(
+                tzinfo=datetime.timezone.utc)
+        except ValueError:
+            pass
+    return datetime.datetime.fromtimestamp(session.path.stat().st_mtime,
+                                           datetime.timezone.utc)
+
+
 def _compact_tool_labels(labels: list[str]) -> list[str]:
     """Deduplicate tool labels and cap repetitive categories without losing edits."""
     unique = list(dict.fromkeys(labels))
@@ -978,9 +1155,9 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
     return "\n".join(header) + body
 
 
-def build_combined(sessions: list[tuple[list[dict], str, str]],
-                   show_tools: bool) -> str:
-    """Stitch several sessions into one document, in the order given.
+def build_combined(sessions: list[Session], show_tools: bool,
+                   lineage: dict[str, list[str]] | None = None) -> str:
+    """Stitch several sessions into one document, in the order given to it.
 
     Several ids are usually one conversation continued across sessions, so the
     reader wants a single file to page through rather than N of them: a shared
@@ -988,13 +1165,14 @@ def build_combined(sessions: list[tuple[list[dict], str, str]],
     the turn headings (`##`) unchanged.
     """
     parts = []
-    for records, session_id, provider in sessions:
-        body, exchanges = _transcript_body(records, show_tools, provider)
+    for session in sessions:
+        body, exchanges = _transcript_body(session.records, show_tools,
+                                           session.provider)
         parts.append({
-            "id": session_id,
-            "provider": provider,
-            "cwd": _session_cwd(records, provider),
-            "stamps": _timestamps(records),
+            "id": session.id,
+            "provider": session.provider,
+            "cwd": _session_cwd(session.records, session.provider),
+            "stamps": _timestamps(session.records),
             "turns": exchanges,
             "body": body,
         })
@@ -1015,12 +1193,18 @@ def build_combined(sessions: list[tuple[list[dict], str, str]],
         "",
         BLURB,
         "",
-        "Sessions below, in the order they were given:",
+        "Sessions in this file:",
         "",
     ]
+    # Say why each session is here, so a chain pulled in by --deep is legible
+    # (and a wrong turn in the walk is obvious) rather than just a longer file.
+    position = {p["id"]: i for i, p in enumerate(parts, 1)}
     for i, p in enumerate(parts, 1):
+        origins = [f"#{position[pid]}" for pid in (lineage or {}).get(p["id"], [])
+                   if pid in position]
+        resumed = f" · resumed from {', '.join(origins)}" if origins else ""
         out.append(f"{i}. `{p['id']}` — {_source_name(p['provider'])} · "
-                   f"{_turns(p['turns'])} · {_span(p['stamps'])}")
+                   f"{_turns(p['turns'])} · {_span(p['stamps'])}{resumed}")
     out.append("")
 
     for i, p in enumerate(parts, 1):
@@ -1061,19 +1245,20 @@ def _local_date(stamp: str) -> str:
         return stamp[:10]
 
 
-def save_out_path(path: Path, provider: str, records: list[dict],
-                  session_id: str, extra: int) -> Path:
+def save_out_path(session: Session, extra: int) -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
     Named for a human scanning a repo listing, not for a machine: the date and
     the opening prompt are what you recognize it by months later. The short id
     keeps two same-day sessions apart and maps the file back to its session.
     """
-    stamps = _timestamps(records)
+    stamps = _timestamps(session.records)
     date = (_local_date(stamps[0]) if stamps else
-            datetime.date.fromtimestamp(path.stat().st_mtime).isoformat())
-    slug = _slugify(first_user_snippet(path, provider, limit=120)) or "session"
-    name = f"{date}-{slug}-{session_id[:8]}"
+            datetime.date.fromtimestamp(session.path.stat().st_mtime).isoformat())
+    topic = first_user_snippet(session.path, session.provider, limit=120,
+                               skip_commands=True)
+    slug = _slugify(_SESSION_ID_RE.sub(" ", topic)) or "session"
+    name = f"{date}-{slug}-{session.id[:8]}"
     if extra:
         name += f"+{extra}more"
     return Path(SAVE_DIR) / f"{name}.md"
@@ -1115,7 +1300,9 @@ def main() -> None:
             "searches the\nClaude Code and Codex stores; the matching store "
             "selects the provider.\n\n"
             "Several ids are stitched into a single transcript, in the order "
-            "given,\neach session under its own heading.\n\n"
+            "given,\neach session under its own heading. --deep adds the "
+            "sessions they were\nresumed from, transitively, oldest first: "
+            "name the newest chat in a chain\nand get all of it.\n\n"
             "The transcript file path is printed as the LAST stdout line "
             "(read that\nfile). Default location is throwaway:\n"
             "  $TMPDIR/session-transcript/<sessionId>/summary.md    (one id)\n"
@@ -1131,6 +1318,9 @@ def main() -> None:
                        help="write the transcript here instead of the default path")
     where.add_argument("--save", action="store_true",
                        help=f"keep it in the project: {SAVE_DIR}/<date>-<topic>-<id>.md")
+    ap.add_argument("--deep", action="store_true",
+                    help="also pull in the sessions these were resumed from, "
+                         "transitively (follows /resume-lite invocations)")
     ap.add_argument("--tools", dest="tools", action="store_true", default=True,
                     help="include the 🔧 tools trace (default)")
     ap.add_argument("--no-tools", dest="tools", action="store_false",
@@ -1145,29 +1335,35 @@ def main() -> None:
 
     # Resolve every id before writing anything so a missing/ambiguous id fails
     # the whole run up front instead of leaving a half-written transcript.
-    # Dedupe on the resolved file: the same session named twice (say a prefix
-    # and its full id) would only repeat a section.
+    # Dedupe on the resolved file: the same session named twice (say by id and
+    # by path) would only repeat a section.
     resolved: list[tuple[Path, str]] = []
     for session in args.sessions:
         found = find_session_file(session)
         if found not in resolved:
             resolved.append(found)
 
-    loaded = []
-    for path, provider in resolved:
-        records = load_records(path)
-        loaded.append((records, canonical_session_id(records, path, provider), provider))
+    sessions = [load_session(path, provider) for path, provider in resolved]
+    parents: dict[str, list[str]] = {}
+    if args.deep:
+        sessions, parents = follow_lineage(sessions)
+        if len(sessions) == len(resolved):
+            print("--deep: no earlier sessions referenced", file=sys.stderr)
+        # Oldest first, so a resume chain reads forward (chat 1, 2, 3) no
+        # matter which end of it the caller happened to name.
+        sessions.sort(key=session_start)
 
-    if len(loaded) == 1:
-        records, session_id, provider = loaded[0]
-        transcript = build_transcript(records, session_id, args.tools, provider)
-        default_out = OUT_ROOT / session_id / "summary.md"
+    if len(sessions) == 1:
+        only = sessions[0]
+        transcript = build_transcript(only.records, only.id, args.tools,
+                                      only.provider)
+        default_out = OUT_ROOT / only.id / "summary.md"
     else:
-        # Several ids -> one stitched file, in argument order: the caller is
-        # picking up one conversation spread over sessions, so it should end up
-        # as one thing to read, not N.
-        transcript = build_combined(loaded, args.tools)
-        default_out = combined_out_path([s[1] for s in loaded])
+        # Several sessions -> one stitched file: the caller is picking up one
+        # conversation spread over sessions, so it should end up as one thing
+        # to read, not N. Explicit ids keep argument order; --deep sorts.
+        transcript = build_combined(sessions, args.tools, parents)
+        default_out = combined_out_path([s.id for s in sessions])
 
     # Why a file instead of just printing the transcript to stdout for the
     # invoking agent to consume: a full transcript can be large, and tool
@@ -1175,9 +1371,7 @@ def main() -> None:
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
     if args.save:
-        first_path, first_provider = resolved[0]
-        out = save_out_path(first_path, first_provider, loaded[0][0],
-                            loaded[0][1], len(loaded) - 1)
+        out = save_out_path(sessions[0], len(sessions) - 1)
     else:
         out = Path(args.out) if args.out else default_out
     out.parent.mkdir(parents=True, exist_ok=True)

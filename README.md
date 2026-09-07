@@ -50,6 +50,18 @@ given, each session under its own heading — one conversation continued across
 sessions stays one thing to read (written to
 `$TMPDIR/session-transcript/<id1+id2+...>/combined.md`).
 
+If that session was itself resumed from an earlier one, `--deep` walks the
+chain back — transitively, and across providers — and lays it out oldest-first
+in the same single file, so naming the most recent chat is enough:
+
+```
+/resume-lite <sessionId> --deep
+# --deep: 6927fbaf resumed from 01a02f7d
+```
+
+It's deterministic, not a guess: a chat started with `/resume-lite <id>` records
+that id in its own transcript, so the parser reads it straight back out.
+
 Or **keep** a session instead of resuming it — `--save` writes the transcript
 into the project, named to be recognizable in a repo listing, so it can be
 committed alongside the work it describes:

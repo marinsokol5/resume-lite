@@ -25,6 +25,11 @@ since it scopes sessions to the working directory.
    a single transcript, in the order given) and prints its path as the **last
    stdout line**. On a missing/ambiguous id it exits non-zero with the reason —
    relay that and ask the user to confirm.
+   1. **Continuing a chain of chats** — when the session was itself resumed
+   from an earlier one (and that one from another), add `--deep`: it follows
+   the ids each session was resumed from, transitively, and stitches the whole
+   chain oldest-first into the same single file. The user only has to name the
+   most recent chat.
    1. **Saving instead of resuming** — when the user asks to keep, save or
    archive a session rather than continue it, add `--save`. The transcript then
    lands in the project as `transcripts/<date>-<topic>-<id>.md`, ready to
