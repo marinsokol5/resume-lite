@@ -4,11 +4,13 @@ Run with: python3 -m unittest discover -s tests
 """
 
 import contextlib
+import datetime
 import filecmp
 import io
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import subprocess
 import sys
@@ -98,6 +100,13 @@ class LineageTests(unittest.TestCase):
                        f"<command-args>{IDS[0]} --save</command-args>"):
             self.assertEqual(lineage({"type": "user", "message": {"content": prompt}},
                                      "claude"), [])
+
+    def test_recaps_are_not_resumes(self):
+        # A recap names only the sessions it leaves out.
+        self.assert_command(f"python3 ./session-transcript --recent 3 --exclude {IDS[0]}",
+                            [])
+        self.assert_command(f"python3 ./session-transcript --exclude={IDS[0]} --recent=3",
+                            [])
 
     def test_codex_code_mode_exec(self):
         # Code mode runs commands from JS: string literals keep `\n` and `\"`
@@ -405,6 +414,425 @@ class OutputTests(unittest.TestCase):
         text = TRANSCRIPT["build_combined"](sessions, True, parents)
         for i, sid in enumerate(IDS[:3], 1):
             self.assertIn(f"# Session {i} of 3 — `{sid}`", text)
+
+
+MESSAGE_RE = re.compile(r"^## (?:👤 User|🤖 Claude|🤖 Codex|📋 Plan)", re.MULTILINE)
+
+
+def claude_messages(*texts, stamp=lambda i: f"2026-09-01T12:{i:02d}:00Z", cwd="/p"):
+    """Claude records alternating user / assistant, each reply then a tool call."""
+    records = []
+    for i, text in enumerate(texts):
+        if i % 2 == 0:
+            records.append({"type": "user", "message": {"content": text},
+                            "timestamp": stamp(i), "cwd": cwd})
+        else:
+            records.append({"type": "assistant", "timestamp": stamp(i), "message": {
+                "content": [{"type": "text", "text": text}]}})
+            records.append({"type": "assistant", "timestamp": stamp(i), "message": {
+                "content": [{"type": "tool_use", "name": "Read",
+                             "input": {"file_path": f"/p/{text}.py"}}]}})
+    return records
+
+
+def plan(text):
+    return {"type": "assistant", "message": {"content": [{
+        "type": "tool_use", "name": "ExitPlanMode", "input": {"plan": text}}]}}
+
+
+class TrimTests(unittest.TestCase):
+    def body(self, records, messages):
+        return TRANSCRIPT["_transcript_body"](records, True, "claude", messages)[0]
+
+    def test_whole_when_two_m_or_fewer(self):
+        for count, keep in ((3, 5), (4, 2), (6, 3), (1, 1)):
+            records = claude_messages(*(f"m{i}" for i in range(count)))
+            with self.subTest(count=count, keep=keep):
+                body = self.body(records, keep)
+                self.assertEqual(body, self.body(records, None))
+                self.assertEqual(len(MESSAGE_RE.findall(body)), count)
+                self.assertNotIn("omitted", body)
+
+    def test_first_and_last_m_around_one_marker(self):
+        for count, keep, omitted in ((5, 2, "1 message omitted"),
+                                     (10, 2, "6 messages omitted"),
+                                     (7, 1, "5 messages omitted")):
+            texts = [f"m{i}" for i in range(count)]
+            with self.subTest(count=count, keep=keep):
+                body = self.body(claude_messages(*texts), keep)
+                kept = texts[:keep] + texts[-keep:]
+                self.assertEqual(len(MESSAGE_RE.findall(body)), 2 * keep)
+                self.assertEqual(body.count("## ✂️"), 1)
+                self.assertIn(f"## ✂️ {omitted}", body)
+                self.assertIn(f"the first {keep} and last {keep} of this "
+                              f"session's {count} messages", body)
+                for text in texts:
+                    self.assertEqual(f"\n\n{text}\n" in body, text in kept, text)
+                head, tail = body.split("## ✂️")
+                self.assertTrue(all(f"\n{t}\n" in head for t in texts[:keep]))
+                self.assertTrue(all(f"\n{t}\n" in tail for t in texts[-keep:]))
+
+    def test_tool_trace_travels_with_its_message(self):
+        body = self.body(claude_messages(*(f"m{i}" for i in range(7))), 2)
+        self.assertIn("Read(m1.py)", body)  # after kept reply m1
+        self.assertIn("Read(m5.py)", body)  # after kept reply m5
+        self.assertNotIn("Read(m3.py)", body)  # after an omitted reply
+
+    def test_plans_count_as_messages(self):
+        # A plan alone between prompts is the assistant's reply...
+        records = claude_messages("m0", "m1", "m2")
+        records.append(plan("p3"))
+        body = self.body(records, 1)
+        self.assertIn("## ✂️ 2 messages omitted", body)
+        self.assertIn("## 📋 Plan (Claude)\n\np3", body)
+        # ...and one after the assistant's text belongs to that same reply.
+        records = claude_messages("m0", "m1") + [plan("p2")] + claude_messages("m3")
+        body = self.body(records, 1)
+        self.assertIn("## ✂️ 1 message omitted", body)
+        self.assertNotIn("p2", body)
+
+    def test_a_reply_is_one_message_however_many_blocks(self):
+        # Claude often answers in a dozen blocks; the last ask must survive.
+        def reply(prefix, count):
+            return [r for i in range(count)
+                    for r in claude_messages("_", f"{prefix}{i}")[1:]]
+        records = (claude_messages("ask0") + reply("long", 12)
+                   + claude_messages("ask1") + reply("mid", 3)
+                   + claude_messages("ask2") + reply("last", 5))
+        whole = self.body(records, None)
+        self.assertEqual(self.body(records, 3), whole)  # 6 messages <= 2 * 3
+        body = self.body(records, 2)
+        self.assertIn("## ✂️ 2 messages omitted", body)
+        self.assertIn("of this session's 6 messages", body)
+        for kept in ["ask0", "ask2"] + [f"long{i}" for i in range(12)] \
+                + [f"last{i}" for i in range(5)]:
+            self.assertIn(f"\n\n{kept}\n", body)
+        for dropped in ["ask1", "mid0", "mid2"]:
+            self.assertNotIn(f"\n\n{dropped}\n", body)
+        self.assertIn("Read(long11.py)", body)  # tool lines stay with their reply
+        self.assertNotIn("Read(mid1.py)", body)
+        body = self.body(records, 1)
+        self.assertIn("## ✂️ 4 messages omitted", body)
+        self.assertEqual(body.count("## 🤖 Claude"), 5)  # the whole last reply
+
+    def test_reading_backwards(self):
+        lines_backwards = TRANSCRIPT["_lines_backwards"]
+        lines = [b"a" * 10, b"", b"bbb", b"c" * 25, b"d"]
+        for ending in (b"", b"\n"):
+            data = b"\n".join(lines) + ending
+            expected = list(reversed(data.split(b"\n")))
+            for step in (1, 2, 3, 4, 7, 64):
+                with self.subTest(ending=ending, step=step):
+                    self.assertEqual(list(lines_backwards(io.BytesIO(data), step)),
+                                     expected)
+        self.assertEqual(list(lines_backwards(io.BytesIO(b""))), [])
+
+    def test_last_activity_skips_bad_timestamps(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "s.jsonl"
+            path.write_text("\n".join(json.dumps(r) for r in (
+                {"timestamp": "2026-09-01T12:00:00Z"},
+                {"timestamp": "2026-09-02T12:00:00Z"},
+                {"timestamp": "yesterday"},
+                {"type": "bridge-session"},
+                {"timestamp": "x" * 300_000},
+            )) + "\n", encoding="utf-8")
+            os.utime(path, (1, 1))
+            self.assertEqual(TRANSCRIPT["last_activity"](path),
+                             datetime.datetime(2026, 9, 2, 12,
+                                               tzinfo=datetime.timezone.utc).timestamp())
+
+
+class RecentTests(unittest.TestCase):
+    """--recent selection, filters, output naming, and --messages end to end."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix="recent-test-")
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.project = self.root / "project"
+        self.project.mkdir()
+        self.cwd = os.path.realpath(self.project)
+        self.home = self.root / "home"
+        self.codex = self.root / "codex"
+        self.claude_dir = (self.home / ".claude" / "projects"
+                           / TRANSCRIPT["encode_cwd"](self.cwd))
+        self.claude_dir.mkdir(parents=True)
+        (self.codex / "sessions" / "2026").mkdir(parents=True)
+        self.files = {}
+
+    def add(self, sid, provider, day, count=2, mtime=None, extra=()):
+        """A session whose last message is on 2026-09-<day>."""
+        stamp = lambda i: f"2026-09-{day:02d}T12:{i:02d}:00Z"
+        texts = [f"{sid[:8]} message {i}" for i in range(count)]
+        if provider == "claude":
+            records = claude_messages(*texts, stamp=stamp, cwd=self.cwd)
+            path = self.claude_dir / f"{sid}.jsonl"
+        else:
+            records = [{"type": "session_meta", "timestamp": stamp(0),
+                        "payload": {"id": sid, "cwd": self.cwd}}]
+            for i, text in enumerate(texts):
+                kind = "user_message" if i % 2 == 0 else "agent_message"
+                records.append({"type": "event_msg", "timestamp": stamp(i),
+                                "payload": {"type": kind, "message": text}})
+            path = self.codex / "sessions" / "2026" / f"rollout-x-{sid}.jsonl"
+        records += list(extra)
+        path.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        self.files[sid] = path
+        return path
+
+    def run_script(self, *args, env=None):
+        environ = {**os.environ, "TMPDIR": str(self.root), "HOME": str(self.home),
+                   "CODEX_HOME": str(self.codex)}
+        for name in TRANSCRIPT["CURRENT_SESSION_ENV"]:
+            environ.pop(name, None)
+        environ.update(env or {})
+        return subprocess.run(
+            [sys.executable, str(SCRIPT), *map(str, args)], cwd=self.project,
+            env=environ, text=True, capture_output=True, timeout=10)
+
+    def recap(self, *args, env=None):
+        result = self.run_script(*args, env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = Path(result.stdout.strip().splitlines()[-1])
+        out = out if out.is_absolute() else self.project / out
+        return out, out.read_text(encoding="utf-8"), result.stderr
+
+    def picked(self, text):
+        return re.findall(r"^# Session \d+ of \d+ — `([^`]+)`", text, re.MULTILINE)
+
+    def assert_rejected(self, *args, message, env=None):
+        result = self.run_script(*args, env=env)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(message, result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_newest_first_across_providers(self):
+        for sid, provider, day in ((IDS[0], "claude", 1), (IDS[1], "codex", 3),
+                                   (IDS[2], "claude", 2), (IDS[3], "codex", 4)):
+            self.add(sid, provider, day)
+        out, text, _ = self.recap("--recent", 3)
+        self.assertEqual(self.picked(text), [IDS[3], IDS[1], IDS[2]])
+        self.assertEqual(out.name, "recent.md")
+        self.assertTrue(out.parent.name.startswith(
+            f"recent-{IDS[3][:8]}+{IDS[1][:8]}+{IDS[2][:8]}-"))
+        self.assertTrue(text.startswith("# Session transcript — 3 most recent sessions\n"))
+        self.assertIn("> The 3 most recent sessions in this project, newest first.", text)
+        self.assertNotIn("continue the work", text)
+
+    def test_recency_is_last_activity_not_mtime(self):
+        # Reopening an old chat appends untimestamped bookkeeping (bumping
+        # mtime); that's not activity.
+        bookkeeping = [{"type": "bridge-session", "sessionId": IDS[0]}]
+        self.add(IDS[0], "claude", 1, mtime=2_000_000_000, extra=bookkeeping)
+        self.add(IDS[1], "claude", 5, mtime=1_000_000_000)
+        self.add(IDS[2], "codex", 3, mtime=1_500_000_000)
+        _, text, _ = self.recap("--recent", 3)
+        self.assertEqual(self.picked(text), [IDS[1], IDS[2], IDS[0]])
+
+    def test_provider_filter(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        self.add(IDS[2], "claude", 3)
+        _, text, _ = self.recap("--recent", 5, "--provider", "claude")
+        self.assertEqual(self.picked(text), [IDS[2], IDS[0]])
+        self.assertIn("> The 2 most recent Claude Code sessions", text)
+        _, text, _ = self.recap("--recent", 5, "--provider", "codex")
+        self.assertEqual(self.picked(text), [IDS[1]])
+        self.assertTrue(text.startswith(
+            "# Session transcript — 1 most recent Codex session\n"))
+        self.assert_rejected("--recent", 1, "--provider", "gemini",
+                             message="invalid choice")
+
+    def test_exclude(self):
+        ids = IDS[:3] + ["abcdef12-1111-4111-8111-abcdefabcdef"]
+        for i, day in enumerate((1, 2, 3, 4)):
+            self.add(ids[i], "claude" if i % 2 else "codex", day)
+        _, text, _ = self.recap("--recent", 2, "--exclude", ids[3])
+        self.assertEqual(self.picked(text), [ids[2], ids[1]])
+        _, text, _ = self.recap("--recent", 2, "--exclude", ids[3].upper(),
+                                "--exclude", ids[2], "--exclude", "not-a-session")
+        self.assertEqual(self.picked(text), [ids[1], ids[0]])
+        # `this`, resolved like the session argument.
+        _, text, err = self.recap("--recent", 2, "--exclude", "This",
+                                  env={"CODEX_THREAD_ID": ids[2]})
+        self.assertEqual(self.picked(text), [ids[3], ids[1]])
+        self.assertIn(f"--exclude this: {ids[2]} (from CODEX_THREAD_ID)", err)
+        # Unresolvable `this` warns and excludes nothing rather than failing.
+        _, text, err = self.recap("--recent", 1, "--exclude", "this")
+        self.assertEqual(self.picked(text), [ids[3]])
+        self.assertIn("nothing is excluded", err)
+
+    def test_fewer_than_n_none_and_empty_sessions(self):
+        self.assert_rejected("--recent", 3, message="no Claude Code or Codex sessions")
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        self.add(IDS[2], "claude", 3, count=0)  # opened, never used
+        _, text, err = self.recap("--recent", 10)
+        self.assertEqual(self.picked(text), [IDS[1], IDS[0]])
+        self.assertIn("--recent 10: only 2 sessions found", err)
+        self.assert_rejected("--recent", 3, "--exclude", IDS[0], "--exclude", IDS[1],
+                             message="(after --exclude)")
+        self.assert_rejected("--recent", 3, "--provider", "claude", "--exclude", IDS[0],
+                             message="no Claude Code sessions")
+
+    def test_bad_combinations_are_rejected(self):
+        self.add(IDS[0], "claude", 1)
+        self.assert_rejected("--recent", 2, IDS[0], message="give it no session ids")
+        self.assert_rejected("--recent", 2, "--deep", message="doesn't combine with --recent")
+        self.assert_rejected(IDS[0], "--provider", "codex", message="only go with --recent")
+        self.assert_rejected(IDS[0], "--exclude", "this", message="only go with --recent")
+        self.assert_rejected("--provider", "codex", message="only go with --recent")
+        for flag in ("--recent", "--messages"):
+            for value, message in (("0", "must be 1 or more"), ("-2", "must be 1 or more"),
+                                   ("abc", "whole number"), ("1.5", "whole number")):
+                with self.subTest(flag=flag, value=value):
+                    args = (flag, value) if flag == "--recent" else (IDS[0], flag, value)
+                    self.assert_rejected(*args, message=message)
+
+    def test_paths_never_collide_with_resume(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        recap, _, _ = self.recap("--recent", 2)
+        resume, _, _ = self.recap(IDS[1], IDS[0])
+        self.assertEqual(resume.name, "combined.md")
+        self.assertNotEqual(recap.parent, resume.parent)
+        single_recap, _, _ = self.recap("--recent", 1)
+        single_resume, _, _ = self.recap(IDS[1])
+        self.assertEqual(single_resume, self.root / "session-transcript" / IDS[1]
+                         / "summary.md")
+        self.assertNotEqual(single_recap.parent, single_resume.parent)
+
+    def write(self, sid, provider, day, prompts, reply="Done."):
+        """A session of typed prompts, each answered with `reply`."""
+        records, stamp = [], f"2026-09-{day:02d}T12:00:00Z"
+        if provider == "claude":
+            for prompt in prompts:
+                records += [
+                    {"type": "user", "timestamp": stamp, "cwd": self.cwd,
+                     "message": {"content": prompt}},
+                    {"type": "user", "isMeta": True, "timestamp": stamp,
+                     "message": {"content": "Base directory for this skill: /s"}},
+                    {"type": "assistant", "timestamp": stamp,
+                     "message": {"content": [{"type": "text", "text": reply}]}},
+                ]
+            path = self.claude_dir / f"{sid}.jsonl"
+        else:
+            records.append({"type": "session_meta", "timestamp": stamp,
+                            "payload": {"id": sid, "cwd": self.cwd}})
+            for prompt in prompts:
+                records += [{"type": "event_msg", "timestamp": stamp, "payload": {
+                                "type": "user_message", "message": prompt}},
+                            {"type": "event_msg", "timestamp": stamp, "payload": {
+                                "type": "agent_message", "message": reply}}]
+            path = self.codex / "sessions" / "2026" / f"rollout-x-{sid}.jsonl"
+        path.write_text("\n".join(map(json.dumps, records)) + "\n", encoding="utf-8")
+
+    def test_sessions_that_only_ran_this_family_are_passed_over(self):
+        def command(name, args=""):
+            return (f"<command-message>{name[1:]}</command-message>\n"
+                    f"<command-name>{name}</command-name>\n"
+                    f"<command-args>{args}</command-args>")
+        skipped = {
+            "a0000000-1111-4111-8111-000000000001": ("claude", [command("/resume-lite")]),
+            "a0000000-1111-4111-8111-000000000002": (
+                "claude", [command("/recap-lite", "10 --messages 5 --codex")]),
+            "a0000000-1111-4111-8111-000000000003": ("codex", ["$recap-lite"]),
+            "a0000000-1111-4111-8111-000000000004": (
+                "codex", [f"$resume-lite {IDS[0]} --deep", "/export-lite this --to notes/"]),
+        }
+        kept = {
+            "b0000000-1111-4111-8111-000000000001": (
+                "claude", [command("/resume-lite", IDS[0]), "now fix the failing test"]),
+            "b0000000-1111-4111-8111-000000000002": (
+                "claude", [command("/resume-lite", f"{IDS[0]} and fix the bug")]),
+            "b0000000-1111-4111-8111-000000000003": ("claude", [command("/review")]),
+            "b0000000-1111-4111-8111-000000000004": (
+                "codex", [f"$resume-lite {IDS[0]}", "keep going"]),
+        }
+        for day, (sid, (provider, prompts)) in enumerate(
+                list(skipped.items()) + list(kept.items()), 1):
+            self.write(sid, provider, day, prompts)
+        _, text, err = self.recap("--recent", 10)
+        self.assertEqual(sorted(self.picked(text)), sorted(kept))
+        self.assertIn("passed over 4 sessions that only ran resume-lite, "
+                      "recap-lite or export-lite", err)
+
+    def test_header_names_what_was_excluded(self):
+        for day in range(1, 6):
+            self.add(IDS[day - 1], "claude", day)  # IDS[4] is the newest
+        current = {"CLAUDE_CODE_SESSION_ID": IDS[4]}
+        for excludes, env, note in (
+            (["this"], current, " (excluding the current session)"),
+            ([IDS[3][:8]], None, " (1 excluded)"),
+            (["this", IDS[3], IDS[2]], current,
+             " (excluding the current session and 2 others)"),
+            ([IDS[0]], None, ""),  # older than both picks: excluded nothing
+        ):
+            with self.subTest(excludes=excludes):
+                args = [arg for sid in excludes for arg in ("--exclude", sid)]
+                _, text, _ = self.recap("--recent", 2, *args, env=env)
+                self.assertIn("\n> The 2 most recent sessions in this project, "
+                              f"newest first{note}.\n", text)
+
+    def test_exclude_prefixes_and_warnings(self):
+        ids = ["abcdef12-1111-4111-8111-000000000001",
+               "abcdef34-1111-4111-8111-000000000002",
+               "12345678-1111-4111-8111-000000000003"]
+        for day, sid in enumerate(ids, 1):
+            self.add(sid, "codex", day)
+        _, text, err = self.recap("--recent", 3, "--exclude", "12345678",
+                                  "--exclude", "ABCDEF12")
+        self.assertEqual(self.picked(text), [ids[1]])
+        self.assertEqual(err.count("ignored"), 0)
+        _, text, err = self.recap("--recent", 3, "--exclude", "abcdef",
+                                  "--exclude", "fedcba98")
+        self.assertEqual(self.picked(text), list(reversed(ids)))
+        self.assertIn("--exclude abcdef: matches 2 sessions, give more of the id; ignored",
+                      err)
+        self.assertIn("--exclude fedcba98: matches no session in this project; ignored",
+                      err)
+
+    def test_recap_saves_never_replace_an_export(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        export, _, _ = self.recap(IDS[1], IDS[0], "--save")
+        recap, _, _ = self.recap("--recent", 2, "--save")
+        self.assertEqual(recap, export.with_name(export.stem + "-recent.md"))
+        single_export, _, _ = self.recap(IDS[1], "--save")
+        single_recap, _, _ = self.recap("--recent", 1, "--to", "kept/")
+        self.assertEqual(single_recap.name, single_export.stem + "-recent.md")
+        trimmed, _, _ = self.recap("--recent", 2, "--save", "--messages", 1)
+        self.assertEqual(trimmed, export.with_name(export.stem + "-recent-m1.md"))
+        self.assertTrue(export.is_file() and single_export.is_file())
+
+    def test_messages_needs_ids_or_recent(self):
+        self.add(IDS[0], "claude", 1)
+        self.assert_rejected("--messages", 2,
+                             message="--messages needs a session id or --recent")
+
+    def test_messages_names_and_explicit_ids(self):
+        self.add(IDS[0], "claude", 1, count=9)
+        self.add(IDS[1], "codex", 2, count=4)
+        full, full_text, _ = self.recap(IDS[0])
+        trimmed, text, _ = self.recap(IDS[0], "--messages", 2)
+        self.assertEqual(trimmed, full.with_name("summary-m2.md"))
+        self.assertEqual(full.read_text(encoding="utf-8"), full_text)  # untouched
+        self.assertIn("## ✂️ 5 messages omitted", text)
+        self.assertIn("> Trimmed with --messages 2: the first and last 2 messages", text)
+        combined, text, _ = self.recap(IDS[0], IDS[1], "--messages", 2)
+        self.assertEqual(combined.name, "combined-m2.md")
+        self.assertEqual(text.count("## ✂️"), 1)  # the 4-message session is whole
+        recap, text, _ = self.recap("--recent", 2, "--messages", 2)
+        self.assertEqual(recap.name, "recent-m2.md")
+        self.assertEqual(text.count("## ✂️"), 1)
+        saved, _, _ = self.recap(IDS[0], "--save")
+        saved_trim, _, _ = self.recap(IDS[0], "--save", "--messages", 2)
+        self.assertEqual(saved_trim, saved.with_name(saved.stem + "-m2.md"))
+        exact, _, _ = self.recap(IDS[0], "--to", "exact.md", "--messages", 2)
+        self.assertEqual(exact, self.project / "exact.md")
 
 
 def frontmatter(text):

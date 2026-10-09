@@ -22,6 +22,9 @@ Usage:
         [--out|--to <path>]      # override output path (a dir gets the --save name)
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
+        [--messages M]           # keep each session's first and last M messages
+    session-transcript --recent N             # this project's N most recent sessions
+        [--provider claude|codex] [--exclude <id>|this ...]  # in ONE file
 
 Sessions are scoped to the current directory. Pass no argument to list Claude
 Code and Codex sessions together (provider · id · time · first prompt); re-run
@@ -52,6 +55,14 @@ drops the "continue the work" line meant for resuming.
 `this` stands for the current session: the script reads CODEX_THREAD_ID (set
 by Codex) or CLAUDE_CODE_SESSION_ID (set by Claude Code's Bash) from its
 environment, and exits non-zero if neither is set.
+
+--recent N recaps instead of resuming: the N most recent sessions here (both
+providers, newest first by last activity, minus any --exclude and sessions
+that only ran this skill family), one file under
+    $TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md
+--messages M keeps only each session's first and last M messages (a message
+is a user prompt, or the assistant's whole reply to it); trimmed files are
+named `-m<M>`.
 
 The output file path is printed to stdout as the last line.
 """
@@ -200,13 +211,19 @@ def find_session_file(session: str) -> tuple[Path, str]:
     return unique[0]
 
 
-def _command_name(msg: dict) -> str | None:
-    """If a Claude user message is a slash-command invocation, return '/name'."""
+def _text_content(msg: dict) -> str | None:
+    """A Claude message's text, its text blocks joined."""
     content = msg.get("content")
     if isinstance(content, list):
         content = "\n".join(b.get("text", "") for b in content
                             if isinstance(b, dict) and b.get("type") == "text")
-    if not isinstance(content, str):
+    return content if isinstance(content, str) else None
+
+
+def _command_name(msg: dict) -> str | None:
+    """If a Claude user message is a slash-command invocation, return '/name'."""
+    content = _text_content(msg)
+    if content is None:
         return None
     m = re.search(r"<command-name>\s*(/[^<\s]+)", content)
     return m.group(1) if m else None
@@ -299,6 +316,57 @@ def list_sessions() -> list[tuple[Path, str, str]]:
             sessions.append((path, "codex", sid))
     sessions.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
     return sessions
+
+
+def _record_moment(line: bytes) -> float | None:
+    """A JSONL record's `timestamp` as epoch seconds, if it has a valid one."""
+    try:
+        record = json.loads(line)
+        stamp = record.get("timestamp") if isinstance(record, dict) else None
+        if not isinstance(stamp, str) or not stamp:
+            return None
+        moment = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.timezone.utc)
+    return moment.timestamp()
+
+
+def _lines_backwards(stream, step: int = 1 << 16):
+    """A binary file's lines, last first, each read and joined only once."""
+    pos = stream.seek(0, os.SEEK_END)
+    later: list[bytes] = []  # pieces of a line with no start found yet, newest first
+    while pos > 0:
+        size = min(step, pos)
+        pos -= size
+        stream.seek(pos)
+        chunk = stream.read(size)
+        if b"\n" not in chunk and pos > 0:
+            later.append(chunk)  # still inside one long line: just collect
+            continue
+        lines = (chunk + b"".join(reversed(later))).split(b"\n")
+        later = [lines.pop(0)] if pos > 0 else []  # its start is further back
+        yield from reversed(lines)
+
+
+def last_activity(path: Path) -> float:
+    """When the session last had a timestamped record (epoch seconds).
+
+    Not the file's mtime: harnesses append untimestamped bookkeeping to old
+    sessions (Claude Code's desktop app adds `bridge-session` records when it
+    reopens one), which would pass a month-old chat off as the newest. Reads
+    backwards from the end, so a long session costs one small read.
+    """
+    try:
+        with path.open("rb") as stream:
+            for line in _lines_backwards(stream):
+                moment = _record_moment(line)
+                if moment is not None:
+                    return moment
+        return path.stat().st_mtime
+    except OSError:
+        return float("-inf")
 
 
 def load_records(path: Path) -> list[dict]:
@@ -965,12 +1033,13 @@ _LINEAGE_PATTERNS = (
     # And the read of what it produced.
     re.compile(r"session-transcript/([0-9a-fA-F-]{36})/"),
 )
-# An invocation that writes the transcript somewhere chosen to keep it
-# (/export-lite runs --save, --out or --to) archives that session, it doesn't
-# continue it, so it names no parent. Matched after quotes and backslashes are
-# blanked out, so `"--save"` and a JS-escaped `\"--save\"` count; argparse
+# Invocations that aren't a resume name no parent: one that writes the
+# transcript somewhere chosen to keep it (/export-lite runs --save, --out or
+# --to) archives a session rather than continuing it, and a --recent recap
+# names only the sessions it --excludes. Matched after quotes and backslashes
+# are blanked out, so `"--save"` and a JS-escaped `\"--save\"` count; argparse
 # abbreviations are off, so `--sa` can't sneak by.
-_EXPORT_FLAG_RE = re.compile(r"(?<!\S)--(?:save|out|to)(?=[\s=]|$)")
+_EXPORT_FLAG_RE = re.compile(r"(?<!\S)--(?:save|out|to|recent)(?=[\s=]|$)")
 _QUOTES_RE = re.compile(r"[\"'\\]")
 # A shell line continuation keeps one command going onto the next line.
 _CONTINUATION_RE = re.compile(r"\\\r?\n")
@@ -1169,35 +1238,62 @@ def _span(timestamps: list[str]) -> str:
     return f"{timestamps[0]} → {timestamps[-1]}" if timestamps else ""
 
 
-def _transcript_body(records: list[dict], show_tools: bool,
-                     provider: str) -> tuple[str, int]:
-    """Render the turns of one session; returns (markdown, user-turn count)."""
-    # Turns: list of ("user"|"assistant", text) plus pending tool names.
-    lines: list[str] = []
+def _plural(count: int, noun: str) -> str:
+    return f"{count} {noun}" + ("" if count == 1 else "s")
+
+
+def _elision(omitted: int, keep: int, total: int) -> list[str]:
+    return [f"## ✂️ {_plural(omitted, 'message')} omitted\n",
+            f"_--messages {keep}: showing the first {keep} and last {keep} of "
+            f"this session's {total} messages._\n"]
+
+
+def _transcript_body(records: list[dict], show_tools: bool, provider: str,
+                     messages: int | None = None) -> tuple[str, int]:
+    """Render the turns of one session; returns (markdown, user-turn count).
+
+    A message is one user prompt (`## 👤 User`), or the assistant's whole reply
+    to it: every `## 🤖 <assistant>` and `## 📋 Plan` block up to the next
+    prompt, with their `🔧 tools:` lines. A reply often runs to a dozen blocks,
+    so counting blocks would let the cut swallow the user's last ask. With
+    `messages`, only the first and last that many are kept, with a marker for
+    the cut.
+    """
+    groups: list[tuple[str, list[str]]] = []  # (user|assistant, its lines)
+    lead: list[str] = []  # a tool trace from before the first message
     exchanges = 0
     pending_tools: list[str] = []
 
     def flush_tools():
         if show_tools and pending_tools:
             compact = ", ".join(_compact_tool_labels(pending_tools))
-            lines.append(f"_🔧 tools: {compact}_\n")
+            (groups[-1][1] if groups else lead).append(f"_🔧 tools: {compact}_\n")
         pending_tools.clear()
+
+    def add(side: str, line: str):
+        flush_tools()
+        if side == "user" or not groups or groups[-1][0] == "user":
+            groups.append((side, []))
+        groups[-1][1].append(line)
 
     assistant_name = "Claude" if provider == "claude" else "Codex"
     for typ, value in normalized_events(records, provider):
         if typ == "user":
-            flush_tools()
             exchanges += 1
-            lines.append(f"## 👤 User\n\n{value}\n")
+            add("user", f"## 👤 User\n\n{value}\n")
         elif typ == "assistant":
-            flush_tools()
-            lines.append(f"## 🤖 {assistant_name}\n\n{value}\n")
+            add("assistant", f"## 🤖 {assistant_name}\n\n{value}\n")
         elif typ == "plan":
-            flush_tools()
-            lines.append(f"## 📋 Plan ({assistant_name})\n\n{value}\n")
+            add("assistant", f"## 📋 Plan ({assistant_name})\n\n{value}\n")
         elif typ == "tool":
             pending_tools.append(value)
     flush_tools()
+    blocks = [lines for _, lines in groups]
+    if messages and len(blocks) > 2 * messages:
+        omitted = len(blocks) - 2 * messages
+        blocks = (blocks[:messages] + [_elision(omitted, messages, len(blocks))]
+                  + blocks[-messages:])
+    lines = lead + [line for block in blocks for line in block]
     return "\n".join(lines), exchanges
 
 
@@ -1208,8 +1304,9 @@ def _meta_line(records: list[dict], provider: str, exchanges: int) -> str:
 
 
 def build_transcript(records: list[dict], session_id: str, show_tools: bool,
-                     provider: str, blurb: str = BLURB) -> str:
-    body, exchanges = _transcript_body(records, show_tools, provider)
+                     provider: str, blurb: str = BLURB,
+                     messages: int | None = None) -> str:
+    body, exchanges = _transcript_body(records, show_tools, provider, messages)
     header = [
         f"# Session transcript — `{session_id}`",
         "",
@@ -1225,7 +1322,8 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
 
 def build_combined(sessions: list[Session], show_tools: bool,
                    lineage: dict[str, list[str]] | None = None,
-                   blurb: str = BLURB) -> str:
+                   blurb: str = BLURB, messages: int | None = None,
+                   title: str | None = None) -> str:
     """Stitch several sessions into one document, in the order given to it.
 
     Several ids are usually one conversation continued across sessions, so the
@@ -1236,7 +1334,7 @@ def build_combined(sessions: list[Session], show_tools: bool,
     parts = []
     for session in sessions:
         body, exchanges = _transcript_body(session.records, show_tools,
-                                           session.provider)
+                                           session.provider, messages)
         parts.append({
             "id": session.id,
             "provider": session.provider,
@@ -1255,10 +1353,10 @@ def build_combined(sessions: list[Session], show_tools: bool,
     sources = ", ".join(dict.fromkeys(_source_name(p["provider"]) for p in parts))
 
     out = [
-        f"# Session transcript — {total} sessions combined",
+        f"# Session transcript — {title or f'{total} sessions combined'}",
         "",
         f"_Source: {sources} · Project: `{cwd}` · {_turns(turns)} "
-        f"across {total} sessions · {span}_",
+        f"across {_plural(total, 'session')} · {span}_",
         "",
         blurb,
         "",
@@ -1296,13 +1394,21 @@ def _session_ids_hash(session_ids: list[str]) -> str:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def combined_out_path(session_ids: list[str]) -> Path:
-    """Default path for a stitched transcript: named after the ids it holds."""
+def combined_out_path(session_ids: list[str], kind: str = "combined",
+                      suffix: str = "") -> Path:
+    """Default path for a stitched transcript: named after the ids it holds.
+
+    A --recent recap lives under `recent-<ids>-<hash>/recent.md`; the prefix
+    keeps it out of resume's `<ids>-<hash>/` (all hex) and `<uuid>/` dirs.
+    """
     shorts = [sid[:8] for sid in session_ids]
     name = "+".join(shorts[:4])
     if len(shorts) > 4:
         name += f"+{len(shorts) - 4}more"
-    return OUT_ROOT / f"{name}-{_session_ids_hash(session_ids)}" / "combined.md"
+    if kind != "combined":
+        name = f"{kind}-{name}"
+    return (OUT_ROOT / f"{name}-{_session_ids_hash(session_ids)}"
+            / f"{kind}{suffix}.md")
 
 
 def _slugify(text: str, limit: int = 48) -> str:
@@ -1320,7 +1426,8 @@ def _local_date(stamp: str) -> str:
         return stamp[:10]
 
 
-def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR) -> Path:
+def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR,
+                  suffix: str = "") -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
     Named for a human scanning a repo listing, not for a machine: the date and
@@ -1338,10 +1445,10 @@ def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR) -> 
     if len(sessions) > 1:
         name += (f"+{len(sessions) - 1}more-"
                  f"{_session_ids_hash([s.id for s in sessions])}")
-    return Path(directory) / f"{name}.md"
+    return Path(directory) / f"{name}{suffix}.md"
 
 
-def out_path(target: str, sessions: list[Session]) -> Path:
+def out_path(target: str, sessions: list[Session], suffix: str = "") -> Path:
     """--out: a file path is the exact name; a directory gets the --save name.
 
     A directory is one that already exists, or a path ending in a separator
@@ -1352,7 +1459,7 @@ def out_path(target: str, sessions: list[Session]) -> Path:
     if target.endswith(separators) and path.exists() and not path.is_dir():
         sys.exit(f"{target}: not a directory")
     if target.endswith(separators) or path.is_dir():
-        return save_out_path(sessions, path)
+        return save_out_path(sessions, path, suffix)
     return path
 
 
@@ -1376,30 +1483,182 @@ def _last_written(session_id: str) -> float:
     return max(stamps, default=float("-inf"))
 
 
-def current_session_id() -> str:
+_NO_CURRENT = (f"neither {' nor '.join(CURRENT_SESSION_ENV)} is set")
+
+
+def _find_current_session() -> tuple[str, str] | None:
+    """(id, where it came from) of the session running this script, if known."""
     found: dict[str, str] = {}  # id -> the variable it came from
     for name in CURRENT_SESSION_ENV:
         value = os.environ.get(name, "").strip()
         if value and value not in found:
             found[value] = name
     if not found:
-        sys.exit(f"can't tell which session is '{CURRENT_SESSION}': neither "
-                 f"{' nor '.join(CURRENT_SESSION_ENV)} is set — pass its id "
-                 "instead (run with no ids to list this project's sessions)")
+        return None
     if len(found) == 1:
         value, name = next(iter(found.items()))
-        note = f"from {name}"
-    else:
-        # Both set and different: one harness runs inside the other (say,
-        # Claude Code started from a Codex shell), each env var inherited or
-        # set by its own. The inner one is the one writing its session right
-        # now, so take whichever session file was modified last.
-        value = max(found, key=_last_written)  # tie: first in CURRENT_SESSION_ENV
-        name = found[value]
-        others = ", ".join(f"{n}={v}" for v, n in found.items() if v != value)
-        note = f"from {name}, the most recently written; not {others}"
+        return value, f"from {name}"
+    # Both set and different: one harness runs inside the other (say, Claude
+    # Code started from a Codex shell), each env var inherited or set by its
+    # own. The inner one is the one writing its session right now, so take
+    # whichever session file was modified last.
+    value = max(found, key=_last_written)  # tie: first in CURRENT_SESSION_ENV
+    others = ", ".join(f"{n}={v}" for v, n in found.items() if v != value)
+    return value, f"from {found[value]}, the most recently written; not {others}"
+
+
+def _is_current(word: str) -> bool:
+    return word.strip().lower() == CURRENT_SESSION
+
+
+def current_session_id() -> str:
+    found = _find_current_session()
+    if found is None:
+        sys.exit(f"can't tell which session is '{CURRENT_SESSION}': {_NO_CURRENT} "
+                 "— pass its id instead (run with no ids to list this "
+                 "project's sessions)")
+    value, note = found
     print(f"{CURRENT_SESSION}: {value} ({note})", file=sys.stderr)
     return value
+
+
+def resolve_excludes(values: list[str], candidates: list[tuple[Path, str, str]]
+                     ) -> tuple[set[str], str | None]:
+    """--exclude values as the full (lowercase) ids they name in this project.
+
+    Each is a full id, a unique prefix of one (say the 8-char short id), or
+    `this`. One naming no session, or several, is reported on stderr and
+    skipped rather than sinking the whole recap. Returns (ids, the current
+    session's id when `this` named one here).
+    """
+    known = list(dict.fromkeys(sid.lower() for _, _, sid in candidates))
+    excluded: set[str] = set()
+    current = None
+    for raw in values:
+        value = raw.strip()
+        this = _is_current(value)
+        if this:
+            found = _find_current_session()
+            if found is None:
+                print(f"--exclude {CURRENT_SESSION}: {_NO_CURRENT}, so nothing "
+                      "is excluded for it", file=sys.stderr)
+                continue
+            value, note = found
+            print(f"--exclude {CURRENT_SESSION}: {value} ({note})", file=sys.stderr)
+        key = value.lower()
+        matches = [sid for sid in known if sid == key] \
+            or [sid for sid in known if key and sid.startswith(key)]
+        if len(matches) != 1:
+            why = (f"matches {len(matches)} sessions, give more of the id"
+                   if matches else "matches no session in this project")
+            print(f"--exclude {raw}: {why}; ignored", file=sys.stderr)
+            continue
+        excluded.add(matches[0])
+        if this:
+            current = matches[0]
+    return excluded, current
+
+
+def _has_messages(session: Session) -> bool:
+    return any(typ in ("user", "assistant", "plan")
+               for typ, _ in normalized_events(session.records, session.provider))
+
+
+# This skill family, typed (`/recap-lite 10`, `$resume-lite <id>`) or as a
+# plugin-namespaced slash command (`/plugin:resume-lite`).
+_FAMILY_COMMAND_RE = re.compile(r"\A[/$](?:[\w.-]+:)?(?:resume|recap|export)-lite\Z")
+# What their arguments look like: ids or prefixes, counts, `this`, flags.
+_FAMILY_ARG_RE = re.compile(
+    r"\A(?:[0-9a-f-]{6,36}|\d+|this|--?[a-z][\w-]*(?:=\S*)?)\Z", re.I)
+_FAMILY_VALUE_FLAGS = frozenset({"--to", "--out", "--exclude", "--messages",
+                                 "--provider", "--recent"})
+_COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+
+
+def _family_invocation(text: str) -> bool:
+    """Whether a prompt only runs resume/recap/export-lite, with nothing typed
+    beyond its arguments (`/resume-lite <id> and fix the bug` is real work)."""
+    tokens = text.split()
+    if not tokens or not _FAMILY_COMMAND_RE.match(tokens[0]):
+        return False
+    takes_value = False
+    for token in tokens[1:]:
+        if takes_value:
+            takes_value = False
+            continue
+        token = token.strip("\"'")
+        if not _FAMILY_ARG_RE.match(token):
+            return False
+        takes_value = token.lower() in _FAMILY_VALUE_FLAGS
+    return True
+
+
+def only_ran_this_family(session: Session) -> bool:
+    """True when every user input in the session just invoked this family.
+
+    A bare `/resume-lite` that only listed sessions, or an earlier recap, would
+    make a recap a summary of summaries. A session where the user went on to
+    type anything else, or ran some other command (whose output is real
+    content), is kept.
+    """
+    invoked = False
+    if session.provider != "claude":
+        for typ, text in normalized_events(session.records, session.provider):
+            if typ == "user":
+                if not _family_invocation(text):
+                    return False
+                invoked = True
+        return invoked
+    for record in session.records:
+        message = record.get("message")
+        if record.get("type") != "user" or record.get("isSidechain") \
+                or record.get("isMeta") or not isinstance(message, dict):
+            continue
+        command = _command_name(message)
+        if command:  # Claude files a slash command's arguments separately
+            args = _COMMAND_ARGS_RE.search(_text_content(message) or "")
+            text = f"{command} {args.group(1) if args else ''}"
+        else:
+            text = user_text(message)
+            if text is None:  # tool results, caveats, interrupt markers
+                continue
+        if not _family_invocation(text):
+            return False
+        invoked = True
+    return invoked
+
+
+def recent_sessions(candidates: list[tuple[Path, str, str]], count: int,
+                    provider: str | None = None, exclude: set[str] = frozenset()
+                    ) -> tuple[list[Session], list[str], int]:
+    """This project's `count` most recent sessions, newest first.
+
+    Recency is the last timestamped record (see last_activity), not mtime.
+    Passed over: excluded ids, sessions with no conversation at all, and
+    sessions that only ran this skill family (see only_ran_this_family).
+    Returns (sessions, excluded ids passed over on the way, family-only
+    sessions passed over), counting only what came before the last pick.
+    """
+    picked: list[Session] = []
+    excluded: list[str] = []
+    summaries = 0
+    for path, session_provider, sid in sorted(
+            candidates, key=lambda item: last_activity(item[0]), reverse=True):
+        if provider and session_provider != provider:
+            continue
+        if sid.lower() in exclude:
+            excluded.append(sid.lower())
+            continue
+        session = load_session(path, session_provider)
+        if not _has_messages(session):
+            continue
+        if only_ran_this_family(session):
+            summaries += 1
+            continue
+        picked.append(session)
+        if len(picked) == count:
+            break
+    return picked, excluded, summaries
 
 
 def print_session_list() -> None:
@@ -1417,6 +1676,48 @@ def print_session_list() -> None:
         snippet = first_user_snippet(path, provider)
         print(f"  {provider:<6}  {sid}  {ts}" + (f"  {snippet}" if snippet else ""))
     print("\nRe-run with one:  session-transcript <sessionId>")
+
+
+def _explicit_sessions(ids: list[str], deep: bool
+                       ) -> tuple[list[Session], dict[str, list[str]]]:
+    """The sessions named on the command line (plus their chain with --deep)."""
+    # Resolve every id before writing anything so a missing/ambiguous id fails
+    # the whole run up front instead of leaving a half-written transcript.
+    # Dedupe on the resolved file: the same session named twice (say by id and
+    # by path) would only repeat a section.
+    resolved: list[tuple[Path, str]] = []
+    for session in ids:
+        if not session.strip():  # e.g. an unset shell variable
+            sys.exit("empty session id")
+        if _is_current(session):
+            session = current_session_id()
+        path, provider = find_session_file(session)
+        found = (path.resolve(), provider)
+        if found not in resolved:
+            resolved.append(found)
+
+    sessions = [load_session(path, provider) for path, provider in resolved]
+    parents: dict[str, list[str]] = {}
+    if deep:
+        sessions, parents = follow_lineage(sessions)
+        if len(sessions) == len(resolved):
+            print("--deep: no earlier sessions referenced", file=sys.stderr)
+        # Oldest first, so a resume chain reads forward (chat 1, 2, 3) no
+        # matter which end of it the caller happened to name.
+        sessions.sort(key=session_start)
+    return sessions, parents
+
+
+def _at_least_one(text: str) -> int:
+    """argparse type for --recent / --messages: a whole number, 1 or more."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"expected a whole number, got {text!r}") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be 1 or more, got {value}")
+    return value
 
 
 def main() -> None:
@@ -1438,7 +1739,10 @@ def main() -> None:
             "  session-transcript <sessionId> [...]     write ONE transcript "
             "file\n"
             "  session-transcript this [...]            `this` = the session "
-            "you run it from\n\n"
+            "you run it from\n"
+            "  session-transcript --recent N            this project's N most "
+            "recent sessions,\n"
+            "                                           in ONE file\n\n"
             "Sessions are scoped to the current directory. Lookup by id "
             "searches the\nClaude Code and Codex stores; the matching store "
             "selects the provider.\n\n"
@@ -1456,7 +1760,34 @@ def main() -> None:
             "--out PATH (alias --to) writes to PATH exactly; if PATH is a "
             "directory\n(exists, or ends in /, created) the --save name goes "
             "inside it:\n"
-            "  --out notes/  ->  notes/<date>-<opening prompt>-<id8>.md"),
+            "  --out notes/  ->  notes/<date>-<opening prompt>-<id8>.md\n\n"
+            "--recent N takes the place of ids: the N most recent sessions in "
+            "this\nproject, Claude Code and Codex together (or --provider "
+            "claude|codex),\nnewest first by last recorded activity (not file "
+            "mtime). Passed over:\n"
+            "  - each --exclude ID: a full id, a unique prefix (the 8-char "
+            "short id\n    works) or `this`; repeatable; one that matches no "
+            "session, or\n    several, is reported on stderr and ignored\n"
+            "  - sessions with no conversation at all\n"
+            "  - sessions whose every prompt only ran /resume-lite, "
+            "/recap-lite or\n    /export-lite (a bare listing, an earlier "
+            "recap); one where the user\n    typed anything else, or ran "
+            "another command, stays\n"
+            "Fewer than N is fine; none is an error. It takes no ids and no "
+            "--deep,\nand writes one recap file with a neutral header:\n"
+            "  $TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md\n"
+            "Kept with --save or --to DIR/, the name gets -recent "
+            "(<date>-<topic>-<id8>\n+<n>more-<hash>-recent.md), so it never "
+            "replaces an export of those ids.\n\n"
+            "--messages M keeps the first M and last M messages of each "
+            "session and\nmarks the cut; a session with 2M or fewer is kept "
+            "whole. A message is\none user prompt (## 👤 User), or the "
+            "assistant's whole reply to it:\nevery ## 🤖 Claude / Codex and "
+            "## 📋 Plan block up to the next prompt,\nwith their 🔧 tools "
+            "lines. It needs ids or --recent. Trimmed files get\n-m<M> in "
+            "their name (summary-m5.md, recent-m5.md,\n"
+            "<date>-<topic>-<id8>-m5.md), so they never replace a full one; "
+            "--out FILE\nis still exact."),
     )
     ap.add_argument("sessions", nargs="*", metavar="session",
                     help="session id(s), or `this` for the current session; "
@@ -1477,55 +1808,96 @@ def main() -> None:
                     help="omit the tools trace (conversation only)")
     ap.add_argument("--stdout", action="store_true",
                     help="also print the transcript to stdout")
+    ap.add_argument("--messages", type=_at_least_one, metavar="M",
+                    help="keep only the first M and last M messages of each "
+                         "session (see below for what a message is)")
+    pick = ap.add_argument_group("recent sessions (instead of ids)")
+    pick.add_argument("--recent", type=_at_least_one, metavar="N",
+                      help="the N most recent sessions in this project, "
+                           "newest first, in one file")
+    pick.add_argument("--provider", choices=("claude", "codex"),
+                      help="with --recent: only Claude Code or only Codex sessions")
+    pick.add_argument("--exclude", action="append", default=[], metavar="ID",
+                      help="with --recent: leave this session out (an id, a "
+                           "unique prefix of one, or `this`); repeatable")
     args = ap.parse_args()
     keep = args.save or args.out is not None
+    recent = args.recent is not None
     if args.out is not None and not args.out.strip():
         ap.error("--out/--to needs a path")
-    if keep and not args.sessions:
-        ap.error("--save/--out/--to need a session id "
+    if recent:
+        if args.sessions:
+            ap.error("--recent picks the sessions itself: give it no session ids")
+        if args.deep:
+            ap.error("--deep follows one conversation's resume chain; it "
+                     "doesn't combine with --recent")
+    elif args.provider or args.exclude:
+        ap.error("--provider and --exclude only go with --recent")
+    if (keep or args.messages) and not args.sessions and not recent:
+        flags = "--save/--out/--to need" if keep else "--messages needs"
+        ap.error(f"{flags} a session id or --recent "
                  "(run with no arguments to list this project's sessions)")
 
-    if not args.sessions:
+    if not args.sessions and not recent:
         print_session_list()
         return
 
-    # Resolve every id before writing anything so a missing/ambiguous id fails
-    # the whole run up front instead of leaving a half-written transcript.
-    # Dedupe on the resolved file: the same session named twice (say by id and
-    # by path) would only repeat a section.
-    resolved: list[tuple[Path, str]] = []
-    for session in args.sessions:
-        if not session.strip():  # e.g. an unset shell variable
-            sys.exit("empty session id")
-        if session.strip().lower() == CURRENT_SESSION:
-            session = current_session_id()
-        path, provider = find_session_file(session)
-        found = (path.resolve(), provider)
-        if found not in resolved:
-            resolved.append(found)
-
-    sessions = [load_session(path, provider) for path, provider in resolved]
     parents: dict[str, list[str]] = {}
-    if args.deep:
-        sessions, parents = follow_lineage(sessions)
-        if len(sessions) == len(resolved):
-            print("--deep: no earlier sessions referenced", file=sys.stderr)
-        # Oldest first, so a resume chain reads forward (chat 1, 2, 3) no
-        # matter which end of it the caller happened to name.
-        sessions.sort(key=session_start)
+    if recent:
+        candidates = list_sessions()
+        exclude, current = resolve_excludes(args.exclude, candidates)
+        sessions, passed, summaries = recent_sessions(
+            candidates, args.recent, args.provider, exclude)
+        which = {"claude": "Claude Code ", "codex": "Codex "}.get(args.provider, "")
+        if summaries:
+            print(f"--recent: passed over {_plural(summaries, 'session')} that "
+                  "only ran resume-lite, recap-lite or export-lite", file=sys.stderr)
+        if not sessions:
+            after = " (after --exclude)" if passed else ""
+            sys.exit(f"--recent: no {which or 'Claude Code or Codex '}sessions "
+                     f"to recap in {os.getcwd()}{after}")
+        if len(sessions) < args.recent:
+            print(f"--recent {args.recent}: only {_plural(len(sessions), 'session')}"
+                  " found", file=sys.stderr)
+        others = len([sid for sid in passed if sid != current])
+        if current in passed:
+            and_others = f" and {_plural(others, 'other')}" if others else ""
+            excluding = f" (excluding the current session{and_others})"
+        else:
+            excluding = f" ({others} excluded)" if others else ""
+    else:
+        sessions, parents = _explicit_sessions(args.sessions, args.deep)
 
-    blurb = EXPORT_BLURB if keep else BLURB
-    if len(sessions) == 1:
+    # Trimmed files get their own name, so they never replace a full one; nor
+    # does a recap saved into the project replace an export of the same ids.
+    suffix = f"-m{args.messages}" if args.messages else ""
+    save_suffix = ("-recent" if recent else "") + suffix
+    # A recap is read to be summarized, not continued: keep its header neutral.
+    blurb = EXPORT_BLURB if keep or recent else BLURB
+    if recent:
+        title = (f"{len(sessions)} most recent {which}session"
+                 + ("" if len(sessions) == 1 else "s"))
+        blurb += f"\n> The {title} in this project, newest first{excluding}."
+    if args.messages:
+        blurb += (f"\n> Trimmed with --messages {args.messages}: the first and "
+                  f"last {args.messages} messages of each session.")
+
+    if recent:
+        transcript = build_combined(sessions, args.tools, None, blurb,
+                                    args.messages, title)
+        default_out = combined_out_path([s.id for s in sessions], "recent", suffix)
+    elif len(sessions) == 1:
         only = sessions[0]
         transcript = build_transcript(only.records, only.id, args.tools,
-                                      only.provider, blurb)
-        default_out = OUT_ROOT / only.id / "summary.md"
+                                      only.provider, blurb, args.messages)
+        default_out = OUT_ROOT / only.id / f"summary{suffix}.md"
     else:
         # Several sessions -> one stitched file: the caller is picking up one
         # conversation spread over sessions, so it should end up as one thing
         # to read, not N. Explicit ids keep argument order; --deep sorts.
-        transcript = build_combined(sessions, args.tools, parents, blurb)
-        default_out = combined_out_path([s.id for s in sessions])
+        transcript = build_combined(sessions, args.tools, parents, blurb,
+                                    args.messages)
+        default_out = combined_out_path([s.id for s in sessions], suffix=suffix)
 
     # Why a file instead of just printing the transcript to stdout for the
     # invoking agent to consume: a full transcript can be large, and tool
@@ -1533,9 +1905,9 @@ def main() -> None:
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
     if args.save:
-        out = save_out_path(sessions)
+        out = save_out_path(sessions, suffix=save_suffix)
     elif args.out is not None:
-        out = out_path(args.out, sessions)
+        out = out_path(args.out, sessions, save_suffix)
     else:
         out = default_out
     try:
