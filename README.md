@@ -8,6 +8,7 @@ session's saved JSONL. No LLM summary. No tokens spent. Near instant.
 | ----- | --------- |
 | [`resume-lite`](#resume-lite) | pick a session back up where it left off |
 | [`export-lite`](#export-lite) | save a session's transcript into the project, to keep or commit |
+| [`recap-lite`](#recap-lite) | catch up on this project's most recent sessions, and what's still in flight |
 
 Because the output is a plain Markdown transcript, it's also a cross-provider
 handoff. Feed a Claude session to Codex, or a Codex session to Claude.
@@ -34,11 +35,11 @@ Plain Agent Skills, need Python 3.
 npx skills add marinsokol5/resume-lite --skill '*'
 
 # Or only the ones you want
-npx skills add marinsokol5/resume-lite --skill export-lite
+npx skills add marinsokol5/resume-lite --skill export-lite --skill recap-lite
 npx skills add marinsokol5/resume-lite --list   # what's in the repo
 
 # Later you can update them through
-npx skills update resume-lite export-lite
+npx skills update resume-lite export-lite recap-lite
 ```
 
 Each works as `/name` in Claude Code and `$name` in Codex.
@@ -114,6 +115,34 @@ next to nothing.
 Exported files get a neutral header (no "continue the work" line), and running
 an export doesn't make the exporting chat count as resumed from it for `--deep`.
 
+## recap-lite
+
+**Catch up** on what's been happening in this project: the most recent Claude
+Code and Codex sessions go into one transcript, which the agent reads to tell
+you, per session, its date, provider and short id, what it was about and where
+it ended — then a short list of what's still in flight, each item with the id
+to `/resume-lite`. It reports and waits; it doesn't act on any of it.
+
+```
+/recap-lite                 # 3 most recent sessions, Claude + Codex, read in full
+/recap-lite 10              # the 10 most recent
+/recap-lite --messages 5    # only the first 5 and last 5 messages of each
+/recap-lite --claude        # only Claude Code sessions (--codex: only Codex)
+```
+
+- **Most recent** means the last recorded activity in each session, not the
+  file's modified time (reopening an old chat touches the file, not its
+  conversation).
+- **Passed over:** the session you're recapping from, Codex's own side
+  threads (subagents, guardian reviews), sessions with no conversation, and
+  sessions that only ran these skills (a bare `/resume-lite` listing, an
+  earlier recap). A session where you went on to type anything else stays.
+- **`--messages M`** keeps the first and last M messages of each session. A
+  message is one prompt, or the assistant's whole reply to it (all its text
+  and tool lines up to the next prompt), so the cut never splits a reply.
+  Read in full, a large session costs up to ~15k tokens; `--messages` is the
+  cheaper read.
+
 ## Run the parser directly
 
 It's bundled in each skill's folder as `scripts/session-transcript` — for a
@@ -125,6 +154,7 @@ The transcript's path is the last line it prints.
 ~/.agents/skills/resume-lite/scripts/session-transcript                     # list this project's sessions
 ~/.agents/skills/resume-lite/scripts/session-transcript <sessionId> [...]   # write ONE transcript, print its path
 ~/.agents/skills/resume-lite/scripts/session-transcript <sessionId> --save  # keep it in transcripts/
+~/.agents/skills/resume-lite/scripts/session-transcript --recent 3          # this project's 3 most recent, ONE file
 ```
 
 Flags: `--deep` (add the chain they were resumed from), `--no-tools` (drop the
@@ -132,6 +162,31 @@ tool trace), `--stdout` (also print it), `--save` (keep it in `transcripts/`),
 `--out <path>` / `--to <path>` (file = exact name; directory = auto-name
 inside it). Run from an agent's shell, `this` stands for that agent's own
 session (read from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`).
+
+Instead of ids, `--recent N` takes the N most recent sessions (newest first,
+by last activity), passing over Codex side threads, empty sessions and ones
+that only ran these skills:
+
+- `--provider claude|codex` — one provider only.
+- `--exclude <id>` — leave a session out: a full id, a unique prefix of 4+
+  characters, or `this`. Repeatable; one that matches nothing is reported and
+  ignored.
+- It takes no ids and no `--deep`.
+
+`--messages M` (with ids or `--recent`) keeps the first and last M messages of
+each session and marks the cut. A message is one user prompt, or the
+assistant's whole reply to it — every assistant and plan block up to the next
+prompt, with their tool lines (tools alone make a reply too). A session with
+2M messages or fewer is kept whole.
+
+Names never collide with a full or resumed transcript:
+
+- A recap: `$TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md`.
+- Trimmed with `--messages M`: `-m<M>` before `.md` (`summary-m5.md`,
+  `recent-m5.md`, `<date>-<topic>-<id8>-m5.md`); `--to FILE` stays exact.
+- A recap kept with `--save` or `--to DIR/`: `-recent` before that
+  (`<date>-<topic>-<id8>+2more-<hash>-recent.md`), so it never replaces an
+  export of the same ids.
 
 
 ## How it works

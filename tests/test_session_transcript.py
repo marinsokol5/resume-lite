@@ -1153,8 +1153,9 @@ class PackagingTests(unittest.TestCase):
         # Each skill carries a real copy (`npx skills update` compares each
         # skill folder's tree hash, so a symlink would never pick up changes).
         skills = sorted(p.parent for p in (REPO / "skills").glob("*/SKILL.md"))
-        self.assertIn(REPO / "skills/export-lite", skills)
-        fix = "edit only the resume-lite copy, then run scripts/sync-skill-scripts"
+        for name in ("resume-lite", "export-lite", "recap-lite"):
+            self.assertIn(REPO / "skills" / name, skills)
+        fix ="edit only the resume-lite copy, then run scripts/sync-skill-scripts"
         for skill in skills:
             script = skill / "scripts" / "session-transcript"
             with self.subTest(skill=skill.name):
