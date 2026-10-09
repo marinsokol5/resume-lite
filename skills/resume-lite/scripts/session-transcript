@@ -16,9 +16,10 @@ Two modes:
 Usage:
     session-transcript                        # list this project's sessions, then exit
     session-transcript <sessionId> [...]      # write ONE transcript file
+                                              # (`this` = the session you're in)
         [--deep]                 # also include what these resumed from
         [--save]                 # keep it in the project (see below)
-        [--out <file>]           # override output path
+        [--out|--to <path>]      # override output path (a dir gets the --save name)
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
 
@@ -42,6 +43,15 @@ Default output is throwaway, under the OS temp dir:
 --save instead writes a keepable transcript into the project, named to be
 recognizable in a repo listing (and committed):
     transcripts/<date>-<opening prompt>-<id8>.md
+
+--out (alias --to) takes a file path as the exact name. A directory (one that
+exists, or a path ending in a separator, which is created) gets that --save
+name inside it. Either way the transcript is a keepable export: its header
+drops the "continue the work" line meant for resuming.
+
+`this` stands for the current session: the script reads CODEX_THREAD_ID (set
+by Codex) or CLAUDE_CODE_SESSION_ID (set by Claude Code's Bash) from its
+environment, and exits non-zero if neither is set.
 
 The output file path is printed to stdout as the last line.
 """
@@ -109,10 +119,16 @@ def _codex_session_files():
                 yield path
 
 
+def _lines(path: Path):
+    """A file's lines, closing it even when the caller stops early."""
+    with path.open(encoding="utf-8") as stream:
+        yield from stream
+
+
 def _detect_provider(path: Path) -> str:
     """Detect a provider from the first recognizable JSONL record."""
     try:
-        for i, line in enumerate(path.open(encoding="utf-8")):
+        for i, line in enumerate(_lines(path)):
             if i >= 50:
                 break
             try:
@@ -211,7 +227,7 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72,
     """
     fallback = ""
     try:
-        for line in path.open(encoding="utf-8"):
+        for line in _lines(path):
             line = line.strip()
             if not line:
                 continue
@@ -248,7 +264,7 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72,
 def _codex_meta(path: Path) -> dict:
     """Read the small session_meta record at the start of a Codex rollout."""
     try:
-        for i, line in enumerate(path.open(encoding="utf-8")):
+        for i, line in enumerate(_lines(path)):
             if i >= 50:
                 break
             try:
@@ -287,7 +303,7 @@ def list_sessions() -> list[tuple[Path, str, str]]:
 
 def load_records(path: Path) -> list[dict]:
     out = []
-    for line in path.open(encoding="utf-8"):
+    for line in _lines(path):
         line = line.strip()
         if not line:
             continue
@@ -949,6 +965,18 @@ _LINEAGE_PATTERNS = (
     # And the read of what it produced.
     re.compile(r"session-transcript/([0-9a-fA-F-]{36})/"),
 )
+# An invocation that writes the transcript somewhere chosen to keep it
+# (/export-lite runs --save, --out or --to) archives that session, it doesn't
+# continue it, so it names no parent. Matched after quotes and backslashes are
+# blanked out, so `"--save"` and a JS-escaped `\"--save\"` count; argparse
+# abbreviations are off, so `--sa` can't sneak by.
+_EXPORT_FLAG_RE = re.compile(r"(?<!\S)--(?:save|out|to)(?=[\s=]|$)")
+_QUOTES_RE = re.compile(r"[\"'\\]")
+# A shell line continuation keeps one command going onto the next line.
+_CONTINUATION_RE = re.compile(r"\\\r?\n")
+# Prose fields that only describe a tool call (Claude's Bash `description`,
+# Codex's `justification`): they can name a session without running anything.
+_PROSE_KEYS = frozenset({"description", "justification"})
 
 
 def _string_values(value):
@@ -961,6 +989,13 @@ def _string_values(value):
     elif isinstance(value, list):
         for item in value:
             yield from _string_values(item)
+
+
+def _tool_input_strings(value):
+    """A tool input's strings, minus the prose fields describing the call."""
+    if isinstance(value, dict):
+        value = {k: v for k, v in value.items() if k not in _PROSE_KEYS}
+    yield from _string_values(value)
 
 
 def _lineage_strings(record: dict, provider: str):
@@ -987,7 +1022,7 @@ def _lineage_strings(record: dict, provider: str):
             for block in content:
                 if not isinstance(block, dict) or block.get("type") != "tool_use":
                     continue
-                yield from _string_values(block.get("input"))
+                yield from _tool_input_strings(block.get("input"))
         return
 
     payload = record.get("payload")
@@ -1012,7 +1047,12 @@ def _lineage_strings(record: dict, provider: str):
                     value = json.loads(value)
                 except json.JSONDecodeError:
                     pass
-            yield from _string_values(value)
+            # A code-mode `exec` input is JS source whose commands sit in string
+            # literals with their newlines still escaped; unescape them so each
+            # command ends at its own line, as in a plain shell call.
+            elif key == "input":
+                value = value.replace("\\n", "\n")
+            yield from _tool_input_strings(value)
 
 
 def lineage_ids(session: Session) -> list[str]:
@@ -1020,8 +1060,11 @@ def lineage_ids(session: Session) -> list[str]:
     found: list[str] = []
     for record in session.records:
         for text in _lineage_strings(record, session.provider):
+            text = _CONTINUATION_RE.sub(" ", text)
             for pattern in _LINEAGE_PATTERNS:
                 for match in pattern.finditer(text):
+                    if _EXPORT_FLAG_RE.search(_QUOTES_RE.sub(" ", match.group(1))):
+                        continue
                     for sid in _SESSION_ID_RE.findall(match.group(1)):
                         sid = sid.lower()
                         if sid != session.id.lower() and sid not in found:
@@ -1102,9 +1145,12 @@ def _compact_tool_labels(labels: list[str]) -> list[str]:
     return compact
 
 
-BLURB = ("> Light transcript (human ↔ assistant text and plan-mode plans; each tool "
-         "call noted with its target when available — tool *outputs* and thinking "
-         "omitted). Read it to recover where we left off, then continue the work.")
+# A kept export (--save/--out/--to) gets only the neutral first sentence: an
+# instruction to continue the work would be baked into a committed file.
+EXPORT_BLURB = ("> Light transcript (human ↔ assistant text and plan-mode plans; each "
+                "tool call noted with its target when available — tool *outputs* and "
+                "thinking omitted).")
+BLURB = EXPORT_BLURB + " Read it to recover where we left off, then continue the work."
 
 
 def _source_name(provider: str) -> str:
@@ -1162,14 +1208,14 @@ def _meta_line(records: list[dict], provider: str, exchanges: int) -> str:
 
 
 def build_transcript(records: list[dict], session_id: str, show_tools: bool,
-                     provider: str) -> str:
+                     provider: str, blurb: str = BLURB) -> str:
     body, exchanges = _transcript_body(records, show_tools, provider)
     header = [
         f"# Session transcript — `{session_id}`",
         "",
         _meta_line(records, provider, exchanges),
         "",
-        BLURB,
+        blurb,
         "",
         "---",
         "",
@@ -1178,7 +1224,8 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
 
 
 def build_combined(sessions: list[Session], show_tools: bool,
-                   lineage: dict[str, list[str]] | None = None) -> str:
+                   lineage: dict[str, list[str]] | None = None,
+                   blurb: str = BLURB) -> str:
     """Stitch several sessions into one document, in the order given to it.
 
     Several ids are usually one conversation continued across sessions, so the
@@ -1213,7 +1260,7 @@ def build_combined(sessions: list[Session], show_tools: bool,
         f"_Source: {sources} · Project: `{cwd}` · {_turns(turns)} "
         f"across {total} sessions · {span}_",
         "",
-        BLURB,
+        blurb,
         "",
         "Sessions in this file:",
         "",
@@ -1273,7 +1320,7 @@ def _local_date(stamp: str) -> str:
         return stamp[:10]
 
 
-def save_out_path(sessions: list[Session]) -> Path:
+def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR) -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
     Named for a human scanning a repo listing, not for a machine: the date and
@@ -1291,7 +1338,68 @@ def save_out_path(sessions: list[Session]) -> Path:
     if len(sessions) > 1:
         name += (f"+{len(sessions) - 1}more-"
                  f"{_session_ids_hash([s.id for s in sessions])}")
-    return Path(SAVE_DIR) / f"{name}.md"
+    return Path(directory) / f"{name}.md"
+
+
+def out_path(target: str, sessions: list[Session]) -> Path:
+    """--out: a file path is the exact name; a directory gets the --save name.
+
+    A directory is one that already exists, or a path ending in a separator
+    (created on write), so `--out notes/` can't quietly become a file `notes`.
+    """
+    separators = tuple(sep for sep in (os.sep, os.altsep) if sep)
+    path = Path(target).expanduser()
+    if target.endswith(separators) and path.exists() and not path.is_dir():
+        sys.exit(f"{target}: not a directory")
+    if target.endswith(separators) or path.is_dir():
+        return save_out_path(sessions, path)
+    return path
+
+
+# `this` names the session the calling agent runs in, read from what each
+# harness sets in its shells: Codex's CODEX_THREAD_ID, Claude Code's (so far
+# undocumented) CLAUDE_CODE_SESSION_ID. Resolved here, not in the skill's shell
+# command, so it works from any shell: in PowerShell "$CODEX_THREAD_ID" is a PS
+# variable, always empty.
+CURRENT_SESSION = "this"
+CURRENT_SESSION_ENV = ("CODEX_THREAD_ID", "CLAUDE_CODE_SESSION_ID")
+
+
+def _last_written(session_id: str) -> float:
+    _, hits = session_hits(session_id)
+    stamps = []
+    for path, _ in hits:
+        try:
+            stamps.append(path.stat().st_mtime)
+        except OSError:
+            pass
+    return max(stamps, default=float("-inf"))
+
+
+def current_session_id() -> str:
+    found: dict[str, str] = {}  # id -> the variable it came from
+    for name in CURRENT_SESSION_ENV:
+        value = os.environ.get(name, "").strip()
+        if value and value not in found:
+            found[value] = name
+    if not found:
+        sys.exit(f"can't tell which session is '{CURRENT_SESSION}': neither "
+                 f"{' nor '.join(CURRENT_SESSION_ENV)} is set — pass its id "
+                 "instead (run with no ids to list this project's sessions)")
+    if len(found) == 1:
+        value, name = next(iter(found.items()))
+        note = f"from {name}"
+    else:
+        # Both set and different: one harness runs inside the other (say,
+        # Claude Code started from a Codex shell), each env var inherited or
+        # set by its own. The inner one is the one writing its session right
+        # now, so take whichever session file was modified last.
+        value = max(found, key=_last_written)  # tie: first in CURRENT_SESSION_ENV
+        name = found[value]
+        others = ", ".join(f"{n}={v}" for v, n in found.items() if v != value)
+        note = f"from {name}, the most recently written; not {others}"
+    print(f"{CURRENT_SESSION}: {value} ({note})", file=sys.stderr)
+    return value
 
 
 def print_session_list() -> None:
@@ -1314,6 +1422,9 @@ def print_session_list() -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(
         add_help=True,
+        # Abbreviations (`--sa` for --save) would slip past the export-flag
+        # check that keeps exports out of --deep lineage; spell flags out.
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Emit a light Markdown transcript of a Claude Code or Codex "
@@ -1325,7 +1436,9 @@ def main() -> None:
             "  session-transcript                       list this project's "
             "sessions, then exit\n"
             "  session-transcript <sessionId> [...]     write ONE transcript "
-            "file\n\n"
+            "file\n"
+            "  session-transcript this [...]            `this` = the session "
+            "you run it from\n\n"
             "Sessions are scoped to the current directory. Lookup by id "
             "searches the\nClaude Code and Codex stores; the matching store "
             "selects the provider.\n\n"
@@ -1339,13 +1452,20 @@ def main() -> None:
             "  $TMPDIR/session-transcript/<id1+id2+...>-<hash>/combined.md (several)\n\n"
             "--save keeps it in the project instead, under a name you can "
             "recognize\nin a repo listing:\n"
-            "  transcripts/<date>-<opening prompt>-<id8>.md"),
+            "  transcripts/<date>-<opening prompt>-<id8>.md\n\n"
+            "--out PATH (alias --to) writes to PATH exactly; if PATH is a "
+            "directory\n(exists, or ends in /, created) the --save name goes "
+            "inside it:\n"
+            "  --out notes/  ->  notes/<date>-<opening prompt>-<id8>.md"),
     )
     ap.add_argument("sessions", nargs="*", metavar="session",
-                    help="session id(s); omit to list this project's sessions")
+                    help="session id(s), or `this` for the current session; "
+                         "omit to list this project's sessions")
     where = ap.add_mutually_exclusive_group()
-    where.add_argument("--out", metavar="FILE",
-                       help="write the transcript here instead of the default path")
+    where.add_argument("--out", "--to", dest="out", metavar="PATH",
+                       help="write the transcript here instead of the default "
+                            "path; a directory (existing, or ending in /) gets "
+                            "the --save name inside it")
     where.add_argument("--save", action="store_true",
                        help=f"keep it in the project: {SAVE_DIR}/<date>-<topic>-<id>.md")
     ap.add_argument("--deep", action="store_true",
@@ -1358,6 +1478,12 @@ def main() -> None:
     ap.add_argument("--stdout", action="store_true",
                     help="also print the transcript to stdout")
     args = ap.parse_args()
+    keep = args.save or args.out is not None
+    if args.out is not None and not args.out.strip():
+        ap.error("--out/--to needs a path")
+    if keep and not args.sessions:
+        ap.error("--save/--out/--to need a session id "
+                 "(run with no arguments to list this project's sessions)")
 
     if not args.sessions:
         print_session_list()
@@ -1369,6 +1495,10 @@ def main() -> None:
     # by path) would only repeat a section.
     resolved: list[tuple[Path, str]] = []
     for session in args.sessions:
+        if not session.strip():  # e.g. an unset shell variable
+            sys.exit("empty session id")
+        if session.strip().lower() == CURRENT_SESSION:
+            session = current_session_id()
         path, provider = find_session_file(session)
         found = (path.resolve(), provider)
         if found not in resolved:
@@ -1384,16 +1514,17 @@ def main() -> None:
         # matter which end of it the caller happened to name.
         sessions.sort(key=session_start)
 
+    blurb = EXPORT_BLURB if keep else BLURB
     if len(sessions) == 1:
         only = sessions[0]
         transcript = build_transcript(only.records, only.id, args.tools,
-                                      only.provider)
+                                      only.provider, blurb)
         default_out = OUT_ROOT / only.id / "summary.md"
     else:
         # Several sessions -> one stitched file: the caller is picking up one
         # conversation spread over sessions, so it should end up as one thing
         # to read, not N. Explicit ids keep argument order; --deep sorts.
-        transcript = build_combined(sessions, args.tools, parents)
+        transcript = build_combined(sessions, args.tools, parents, blurb)
         default_out = combined_out_path([s.id for s in sessions])
 
     # Why a file instead of just printing the transcript to stdout for the
@@ -1403,10 +1534,15 @@ def main() -> None:
     # pagination/offset and re-read spans on demand. Keep this file-first.
     if args.save:
         out = save_out_path(sessions)
+    elif args.out is not None:
+        out = out_path(args.out, sessions)
     else:
-        out = Path(args.out) if args.out else default_out
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(transcript, encoding="utf-8")
+        out = default_out
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(transcript, encoding="utf-8")
+    except OSError as exc:  # e.g. a parent that is a file, or no permission
+        sys.exit(f"cannot write {out}: {exc.strerror or exc}")
     if args.stdout:
         print(transcript)
         print("\n---", file=sys.stderr)
