@@ -720,7 +720,8 @@ class CodexRolloutTests(unittest.TestCase):
         family = TRANSCRIPT["_family_invocation"]
         self.assertTrue(family("/resume-lite 48f4b8ff"))
         self.assertTrue(family(f"$resume-lite {IDS[0]} --deep"))
-        self.assertTrue(family(f"{MENTION} deadbeef"))
+        typed = TRANSCRIPT["_codex_typed_item"]  # how Codex mentions reach it
+        self.assertTrue(family(typed(f"{MENTION} deadbeef")))
         self.assertFalse(family("/resume-lite decade"))  # a word, not an id
         self.assertFalse(family("/resume-lite facade please"))
 
@@ -728,11 +729,36 @@ class CodexRolloutTests(unittest.TestCase):
         typed = TRANSCRIPT["_codex_typed_item"]
         self.assertEqual(typed(f"looks good\n\n{BROWSER}"), "looks good")
         self.assertEqual(typed(f"{AGENTS_MD}\n\nand then this"), "and then this")
-        self.assertEqual(typed(f"{ENV_CONTEXT}{SKILL_BLOCK}"), "")
-        self.assertEqual(typed("<skill>\n<name>x</name>\ncut short"), "")
+        self.assertEqual(typed(f"{ENV_CONTEXT}\n{SKILL_BLOCK}"), "")
         self.assertEqual(typed("# Context from my IDE setup:\n\n## Open tabs:\n- a.py\n\n"
                                "## My request for Codex:\nfix a.py"), "fix a.py")
-        self.assertEqual(typed("what does a <skill> tag do?"), "what does a <skill> tag do?")
+        self.assertEqual(typed("<user_shell_command>\n<command>\nls\n</command>\n<result>\n"
+                               "ok\n</result>\n</user_shell_command>\nwhy is it empty?"),
+                         "!ls\nwhy is it empty?")
+
+    def test_the_same_words_typed_by_the_user_are_kept(self):
+        # Only the exact shape Codex writes is cut: tags written or pasted by
+        # the user (mid-sentence, unclosed, a draft AGENTS.md, other links) stay.
+        typed = TRANSCRIPT["_codex_typed_item"]
+        for text in (
+            "what does a <skill> tag do?",
+            "<skill> blocks show up as user turns, filter them",
+            "please parse <skill><name>x</name></skill> and report",
+            "<skill>x</skill> is what it injects",
+            "# AGENTS.md instructions\n\nhere is my draft:\n- be terse",
+            "see [@john](https://github.com/john) and [docs](https://x.dev/SKILL)",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(typed(text), text)
+        self.assertEqual(typed("ask [@Booking.com](plugin://booking-com@curated) and "
+                               "[$Gmail](app://gmail)"), "ask @Booking.com and $Gmail")
+
+    def test_mentions_only_unwrapped_in_codex_text(self):
+        # A Codex transcript pasted into Claude names no parent of the Claude chat.
+        pasted = f"from codex:\n{MENTION} {IDS[0]} --deep"
+        self.assertEqual(lineage({"type": "user", "message": {"content": pasted}},
+                                 "claude"), [])
+        self.assertEqual(lineage(codex_user(pasted), "codex"), IDS[:1])
 
     def test_lineage_reads_only_typed_turns(self):
         # Genuine resumes, typed or as a Desktop mention; never ids that only

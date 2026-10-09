@@ -944,8 +944,11 @@ def _codex_message_text(payload: dict) -> str | None:
 # loaded, environment and skill context, subagent notices, plugin hints. Newer
 # rollouts carry no `user_message` events to tell the typed turns apart, so
 # these are cut out of each content item, keeping whatever was typed beside them.
+# Each is matched in the exact shape Codex writes it, so the same words typed
+# or pasted by the user (mid-sentence, unclosed, a draft AGENTS.md) are kept.
 _CODEX_AGENTS_MD_RE = re.compile(
-    r"\A\s*# AGENTS\.md instructions\b.*?(?:</INSTRUCTIONS>|\Z)", re.DOTALL)
+    r"\A\s*# AGENTS\.md instructions\b[^\n]*\n\s*<INSTRUCTIONS>.*?</INSTRUCTIONS>",
+    re.DOTALL)
 _CODEX_INJECTED_TAGS = (
     "environment_context", "skill", "subagent_notification", "recommended_plugins",
     "turn_aborted", "user_instructions", "realtime_delegation",
@@ -953,9 +956,10 @@ _CODEX_INJECTED_TAGS = (
     "in-app-browser-context",
 )
 _TAG_NAMES = "|".join(map(re.escape, _CODEX_INJECTED_TAGS))
-_CODEX_INJECTED_RE = re.compile(rf"<({_TAG_NAMES})(?:\s[^>]*)?>.*?</\1>", re.DOTALL)
-# One cut short (no closing tag) only counts when it opens the item.
-_CODEX_UNCLOSED_RE = re.compile(rf"\A\s*<(?:{_TAG_NAMES})(?:\s[^>]*)?>")
+# A whole block: opening tag at the start of a line, closing tag ending one.
+_CODEX_INJECTED_RE = re.compile(
+    rf"^[ \t]*<({_TAG_NAMES})(?:\s[^>\n]*)?>.*?</\1>[ \t]*(?=\n|\Z)",
+    re.DOTALL | re.MULTILINE)
 # IDE and attachment context wrapped around the request ("## My request:"),
 # or just that header left once an injected block before it is cut.
 _CODEX_REQUEST_RE = re.compile(
@@ -965,12 +969,15 @@ _CODEX_REQUEST_RE = re.compile(
 # The user's own `!command`: keep the command, drop its output.
 _CODEX_SHELL_RE = re.compile(
     r"\A\s*<user_shell_command>\s*<command>\s*(.*?)\s*</command>", re.DOTALL)
+_CODEX_SHELL_END = "</user_shell_command>"
 # An answer to a question the agent asked (request_user_input_async).
 _CODEX_REPLY_RE = re.compile(
     r"\A\s*<send_user_message_question_reply>\s*(.*?)\s*"
     r"</send_user_message_question_reply>\s*\Z", re.DOTALL)
-# Codex Desktop files a typed `$skill` (or `@plugin`) mention as a link to it.
-_SKILL_LINK_RE = re.compile(r"\[([/$@][\w.:-]+)\]\([^)\n]*\)")
+# Codex Desktop files a typed `$skill` or `@plugin` mention as a link to its
+# SKILL.md, or a plugin:// / app:// address; any other link stays a link.
+_SKILL_LINK_RE = re.compile(
+    r"\[([$@][\w.:-]+)\]\((?:[^)\n]*SKILL\.md|(?:plugin|app)://[^)\n]*)\)")
 # An attached image: `<image name=[Image #1] path="…">`, then `</image>`.
 _CODEX_IMAGE_RE = re.compile(r"<image name=(\[[^\]\n]*\])[^>\n]*>|</image>")
 
@@ -998,8 +1005,6 @@ def _codex_typed_item(text: str) -> str:
     if match:
         text = text[match.end():]
     text = _CODEX_INJECTED_RE.sub("", text)
-    if _CODEX_UNCLOSED_RE.match(text):
-        return ""
     match = _CODEX_REQUEST_RE.match(text)
     if match:
         text = text[match.end():]
@@ -1007,8 +1012,10 @@ def _codex_typed_item(text: str) -> str:
     if match:
         text = _question_answers(match.group(1))
     match = _CODEX_SHELL_RE.match(text)
-    if match:
-        text = "!" + match.group(1)
+    if match:  # anything typed after the block stays
+        end = text.find(_CODEX_SHELL_END, match.end())
+        after = text[end + len(_CODEX_SHELL_END):].strip() if end != -1 else ""
+        text = "!" + match.group(1) + (f"\n{after}" if after else "")
     text = _CODEX_IMAGE_RE.sub(lambda m: m.group(1) or "", text)
     return _plain_mentions(text).strip()
 
@@ -1251,7 +1258,7 @@ def _lineage_strings(record: dict, provider: str):
     # user_message, not agent_message: the assistant merely discussing a
     # session is not a resume.
     if payload.get("type") == "user_message" and isinstance(payload.get("message"), str):
-        yield payload["message"]
+        yield _plain_mentions(payload["message"])  # Codex's [$skill](…) mentions
     if payload.get("type") == "message" and payload.get("role") == "user":
         text = _codex_typed_text(payload)  # not what the harness injected
         if text:
@@ -1280,7 +1287,7 @@ def lineage_ids(session: Session) -> list[str]:
     found: list[str] = []
     for record in session.records:
         for text in _lineage_strings(record, session.provider):
-            text = _plain_mentions(_CONTINUATION_RE.sub(" ", text))
+            text = _CONTINUATION_RE.sub(" ", text)
             for pattern in _LINEAGE_PATTERNS:
                 for match in pattern.finditer(text):
                     if _EXPORT_FLAG_RE.search(_QUOTES_RE.sub(" ", match.group(1))):
@@ -1739,7 +1746,7 @@ _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 def _family_invocation(text: str) -> bool:
     """Whether a prompt only runs resume/recap/export-lite, with nothing typed
     beyond its arguments (`/resume-lite <id> and fix the bug` is real work)."""
-    tokens = _plain_mentions(text).split()  # Codex Desktop's [$name](path) too
+    tokens = text.split()  # Codex mentions arrive here already as plain `$name`
     if not tokens or not _FAMILY_COMMAND_RE.match(tokens[0]):
         return False
     takes_value = False
