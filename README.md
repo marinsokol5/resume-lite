@@ -83,35 +83,38 @@ export-lite).
 ## export-lite
 
 **Keep** a session instead of resuming it: the transcript is written into the
-project, named to be recognizable in a repo listing, so it can be committed
-alongside the work it describes. The skill reports the path and stops — it
-never reads the transcript back, so exporting costs the current conversation
-next to nothing.
+project as `transcripts/<date>-<topic>.md`, so it can be committed alongside
+the work it describes. Run with no arguments it exports the session you're in;
+the words you give it name the file. It reports the path and stops — it never
+reads the transcript back, so exporting costs the conversation next to nothing.
 
 ```
-/export-lite                        # list sessions, ask which
-/export-lite <id> [<id> ...]        # → transcripts/<date>-<topic>-<id8>.md
-/export-lite this                   # the current session
-/export-lite <id> --deep            # include the chain it was resumed from
-/export-lite <id> --to <path>       # file = exact name; directory = auto-name inside it
-/export-lite <id> --no-tools        # conversation only, no tool trace
+/export-lite                          # this session; the agent picks a short topic
+/export-lite <topic words…>           # this session → transcripts/<date>-<topic>.md
+/export-lite <id> [<id>…] [topic…]    # other session(s)
+/export-lite … path/to/file.md        # exact path, no date (a dir/ → <date>-<topic>.md inside it)
+/export-lite … --deep | --no-tools
 ```
 
 ```
-/export-lite <sessionId>
-# transcripts/2026-09-07-let-s-support-multiple-session-ids-provided-one-48f4b8ff.md
+/export-lite add export-lite and recap-lite skills
+# transcripts/2026-10-09-add-export-lite-and-recap-lite-skills.md
 ```
 
-- **Naming.** Date and opening prompt of the first session, then its short id.
-  Several sessions add `+<n>more-<hash>`, where `<n>` counts the sessions after
-  the first (3 sessions → `+2more`), so another combination with the same
-  opening session doesn't replace the earlier file. With `--deep` the name
-  comes from the oldest session in the chain, not the one you named.
+- **Arguments sort themselves:** session ids (full, or their first 8+
+  characters) and `this` pick sessions; anything with a `/` or ending in `.md`
+  is the path; every other word is the topic.
+- **Naming.** The date the first session started, then the topic: your words
+  (they always win), else a short one the agent picks for the session you're
+  in, else another session's opening prompt. With `--deep` the date is the
+  oldest session's in the chain.
 - **Re-exporting** the same session(s) overwrites that same file — handy to
-  refresh an export once the session has moved on.
-- **`--to`** takes a file path as the exact name. A directory — one that
-  exists, or any path ending in `/` (created) — gets the auto-generated name
-  inside it: `--to notes/` → `notes/<date>-<topic>-<id8>.md`.
+  refresh an export once the session has moved on. Anything else already under
+  that name (a different session, another combination, a recap, a trimmed
+  copy, a file of your own) is left alone, and the new export takes `-2`, `-3`, …
+- **A path** ending in `.md` is used exactly as given (no date). A directory —
+  one that exists, or any path ending in `/` (created) — gets
+  `<date>-<topic>.md` inside it, by the same rules.
 - **`this`** is the session you're in. Claude Code hands the skill its id; in
   Codex (or anywhere it isn't handed over) the parser reads it from
   `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`.
@@ -164,7 +167,7 @@ The transcript's path is the last line it prints.
 Flags: `--deep` (add the chain they were resumed from), `--no-tools` (drop the
 tool trace), `--stdout` (also print it), `--save` (keep it in `transcripts/`),
 `--out <path>` / `--to <path>` (file = exact name; directory = auto-name
-inside it). Run from an agent's shell, `this` stands for that agent's own
+inside it), `--topic TEXT` (name a kept transcript after TEXT). Run from an agent's shell, `this` stands for that agent's own
 session (read from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`). An id can
 be any unique prefix of 8+ characters.
 
@@ -188,10 +191,12 @@ Names never collide with a full or resumed transcript:
 
 - A recap: `$TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md`.
 - Trimmed with `--messages M`: `-m<M>` before `.md` (`summary-m5.md`,
-  `recent-m5.md`, `<date>-<topic>-<id8>-m5.md`); `--to FILE` stays exact.
-- A recap kept with `--save` or `--to DIR/`: `-recent` before that
-  (`<date>-<topic>-<id8>+2more-<hash>-recent.md`), so it never replaces an
-  export of the same ids.
+  `recent-m5.md`).
+- Kept with `--save` or `--to DIR/`, everything is `<date>-<topic>.md`
+  (`--topic TEXT` sets the topic; else the first session's opening prompt): saving
+  the same thing again (same sessions, same kind — one, combined or recap —
+  same `--messages`) overwrites it; anything else takes the first free `-2`,
+  `-3`, …, and a file that isn't one of these transcripts is never touched.
 
 
 ## How it works

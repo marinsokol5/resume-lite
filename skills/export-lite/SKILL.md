@@ -1,6 +1,6 @@
 ---
 name: export-lite
-description: Export a Claude Code or Codex session as a deterministic Markdown transcript (human ↔ assistant text plus compact tool traces) saved into a file in the project, without resuming it. Use when the user runs /export-lite or $export-lite, or asks to export, save, keep or archive a session transcript. Takes one or more session ids, or `this` for the current session; with none, it lists this project's Claude and Codex sessions to choose from.
+description: Export a Claude Code or Codex session as a deterministic Markdown transcript (human ↔ assistant text plus compact tool traces) saved into the project as transcripts/<date>-<topic>.md, without resuming it. Use when the user runs /export-lite or $export-lite, or asks to export, save, keep or archive a session transcript. With no arguments it exports the current session; words name the file; session ids export other sessions; a path picks the file.
 ---
 
 # export-lite
@@ -14,45 +14,50 @@ from the user's **current project directory** — don't `cd` into the skill fold
 since it scopes sessions to the working directory.
 
 ```
-/export-lite                        # list sessions, ask which
-/export-lite <id> [<id> ...]        # → transcripts/<date>-<topic>-<id8>.md
-/export-lite this                   # the current session
-/export-lite <id> --deep            # include the chain it was resumed from
-/export-lite <id> --to <path>       # file = exact name; directory = auto-name inside it
-/export-lite <id> --no-tools        # conversation only, no tool trace
+/export-lite                          # this session; you pick a short topic
+/export-lite <topic words…>           # this session → transcripts/<date>-<topic>.md
+/export-lite <id> [<id>…] [topic…]    # other session(s)
+/export-lite … path/to/file.md        # exact path, no date (a dir/ → <date>-<topic>.md inside it)
+/export-lite … --deep | --no-tools
 ```
 
 ## Steps
 
-1. **Pick the session(s)**
-   1. **No session id provided** Run `python3 scripts/session-transcript` to list
-   this project's sessions, show them to the user, and ask which to export — don't
-   guess.
-   1. **`this`** means the current session. Claude Code fills in its id here:
-   `${CLAUDE_SESSION_ID}`. If that reads as a real session id, pass it;
-   otherwise pass `this` itself and the script finds the current session. If
-   the script then says it can't tell which session is `this`, run it with no
-   ids, take the newest session in the listing, and tell the user which id you
-   picked.
+1. **Sort the arguments.** Each one is:
+   - a **session** — a session id, full or its first 8+ characters (the script
+     resolves it), or `this`;
+   - a **path** — contains `/` or ends in `.md`;
+   - a **flag** — `--deep`, `--no-tools`;
+   - otherwise a **topic word**: all of them, in order, make the topic.
 
-2. **Run session-transcript script** with all ids in one invocation, plus
-   `--save` unless the user gave `--to`:
-   `python3 scripts/session-transcript "<id>" ["<id>" ...] --save`.
-   - **`--to <path>`** — pass `--to "<path>"` instead of `--save`. A path ending
-   in `/`, or an existing directory, gets the auto-generated name inside it
-   (created if needed); anything else is the exact file name. If the user means
-   a folder that doesn't exist yet, end it with `/`.
-   - **`--deep`**, **`--no-tools`** — pass through as given.
+   No session given means the current one. Claude Code fills in its id here:
+   `${CLAUDE_SESSION_ID}`. If that reads as a real session id, use it;
+   otherwise use `this` and the script finds the current session.
 
-   It always writes **one** file (several ids are stitched into a single
+2. **Pick the topic.** The user's own words always win — they name things
+   better. With none, for the current session choose a concise 3–6 word topic
+   saying what it was about; for another session leave the topic out (the file
+   is then named after its opening prompt) rather than read it to find out.
+
+3. **Run session-transcript script**, all sessions in one invocation:
+   `python3 scripts/session-transcript "<id>" ["<id>" ...] --save --topic "<topic>"`
+   - **A path** — `--to "<path>"` instead of `--save`. A file path is used
+     exactly as given, with no date. A directory (an existing one, or a path
+     ending in `/`) gets `<date>-<topic>.md` inside it.
+   - **Flags** — pass through as given.
+
+   It always writes **one** file (several sessions are stitched into a single
    transcript, in the order given) and prints its path as the **last stdout
-   line**. On a missing/ambiguous id it exits non-zero with the reason — relay
-   that and ask the user to confirm.
+   line**. On a missing or ambiguous id it exits non-zero with the reason —
+   relay that and ask the user to confirm. If it says it can't tell which
+   session is `this`, run it with no arguments to list this project's
+   sessions, take the newest, and tell the user which id you picked.
 
-3. **Report the path and stop.** Where it applies, tell the user that
-   exporting the same session(s) again overwrites that same file, and that with
-   `--deep` the auto-generated name comes from the oldest session in the chain,
-   not the id they gave.
+4. **Report the path and stop**, saying which topic you chose if the user
+   didn't give one. Where it applies, tell them that exporting the same
+   session(s) again overwrites that file, while a different session that gets
+   the same name is saved as `-2`, `-3`, …; and that with `--deep` the date
+   comes from the oldest session in the chain.
 
    Never read the transcript back: exporting keeps a session without spending
    this conversation's context on it. Continuing from a session is
