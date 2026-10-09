@@ -478,6 +478,32 @@ class TrimTests(unittest.TestCase):
         self.assertIn("Read(m5.py)", body)  # after kept reply m5
         self.assertNotIn("Read(m3.py)", body)  # after an omitted reply
 
+    def test_tools_run_first_open_the_reply(self):
+        # Prompt -> tool -> text -> tool -> text, and a reply of only tools.
+        def tool(name):
+            return {"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": "Read", "input": {"file_path": f"/p/{name}"}}]}}
+
+        def text(value):
+            return {"type": "assistant", "message": {"content": [
+                {"type": "text", "text": value}]}}
+
+        def ask(value):
+            return {"type": "user", "message": {"content": value}}
+
+        records = [ask("u1"), tool("a"), text("t1"), tool("b"), text("t2"),
+                   ask("u2"), tool("c"), text("t3"),
+                   ask("u3"), tool("d")]
+        whole = self.body(records, None)
+        self.assertEqual(self.body(records, 3), whole)  # 6 messages <= 2 * 3
+        self.assertIn("of this session's 6 messages", self.body(records, 2))
+        body = self.body(records, 1)
+        self.assertIn("## ✂️ 4 messages omitted", body)
+        self.assertTrue(body.startswith("## 👤 User\n\nu1\n\n## ✂️"))  # not Read(a)
+        self.assertTrue(body.endswith("_🔧 tools: Read(d)_\n"))
+        self.assertNotIn("Read(a)", body)
+        self.assertNotIn("u3", body)
+
     def test_plans_count_as_messages(self):
         # A plan alone between prompts is the assistant's reply...
         records = claude_messages("m0", "m1", "m2")
@@ -689,6 +715,14 @@ class CodexRolloutTests(unittest.TestCase):
                          "designer", "Message Type", "interrupted", "Exit code", "v22",
                          "SKILL.md", "/tmp/shot.png", "request_user_input"):
             self.assertNotIn(injected, body)
+
+    def test_family_ids_need_eight_hex_characters(self):
+        family = TRANSCRIPT["_family_invocation"]
+        self.assertTrue(family("/resume-lite 48f4b8ff"))
+        self.assertTrue(family(f"$resume-lite {IDS[0]} --deep"))
+        self.assertTrue(family(f"{MENTION} deadbeef"))
+        self.assertFalse(family("/resume-lite decade"))  # a word, not an id
+        self.assertFalse(family("/resume-lite facade please"))
 
     def test_typed_part_of_a_mixed_item_is_kept(self):
         typed = TRANSCRIPT["_codex_typed_item"]
@@ -983,6 +1017,46 @@ class RecentTests(unittest.TestCase):
         self.assertEqual(self.picked(text), [ids[2]])
         self.assertIn("passed over 2 sessions that only ran", err)
         self.assertNotIn("AGENTS.md", text)
+
+    def test_codex_side_threads_are_not_listed(self):
+        kinds = {
+            "d0000000-1111-4111-8111-000000000001": {},  # the user's own thread
+            "d0000000-1111-4111-8111-000000000002": {  # a user fork: still theirs
+                "forked_from_id": "d0000000-1111-4111-8111-000000000001"},
+            "d0000000-1111-4111-8111-000000000003": {  # a spawned subagent
+                "thread_source": "subagent", "parent_thread_id": "p",
+                "source": {"subagent": {"thread_spawn": {"parent_thread_id": "p"}}}},
+            "d0000000-1111-4111-8111-000000000004": {  # a guardian review
+                "thread_source": "guardian_review", "parent_thread_id": "p",
+                "source": {"subagent": {"other": "guardian"}}},
+            "d0000000-1111-4111-8111-000000000005": {  # older spawn shape
+                "source": {"thread_spawn": {"parent_thread_id": "p"}}},
+        }
+        for day, (sid, meta) in enumerate(kinds.items(), 1):
+            rows = codex_rollout(sid, self.cwd, "0.160.0",
+                                 codex_user(f"task {day}"), codex_reply("ok"))
+            rows[0]["payload"].update(meta)
+            for row in rows:
+                row["timestamp"] = f"2026-09-{day:02d}T12:00:00Z"
+            (self.codex / "sessions" / "2026" / f"rollout-x-{sid}.jsonl").write_text(
+                "\n".join(map(json.dumps, rows)) + "\n", encoding="utf-8")
+        users = list(kinds)[:2]
+        listing = self.run_script().stdout
+        self.assertEqual(re.findall(r"^  codex\s+(\S+)", listing, re.MULTILINE),
+                         users[::-1])
+        _, text, _ = self.recap("--recent", 10)
+        self.assertEqual(self.picked(text), users[::-1])
+        for sid in list(kinds)[2:]:  # still reachable by id
+            out, text, _ = self.recap(sid)
+            self.assertEqual(out.parent.name, sid)
+
+    def test_exclude_prefixes_need_four_characters(self):
+        self.add("abcdef12-1111-4111-8111-000000000001", "codex", 1)
+        _, text, err = self.recap("--recent", 1, "--exclude", "abc")
+        self.assertIn("--exclude abc: too short, give at least 4 characters", err)
+        self.assertEqual(len(self.picked(text)), 1)
+        self.assert_rejected("--recent", 1, "--exclude", "abcd",
+                             message="no Claude Code or Codex sessions")
 
     def test_header_names_what_was_excluded(self):
         for day in range(1, 6):

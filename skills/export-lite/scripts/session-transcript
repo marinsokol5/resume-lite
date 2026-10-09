@@ -310,6 +310,16 @@ def _same_directory(left: str, right: str) -> bool:
         return False
 
 
+def _codex_side_thread(meta: dict) -> bool:
+    """A thread Codex spawned for itself (a subagent, a guardian review), not
+    one the user talked in. A user's own fork (`forked_from_id` alone) stays."""
+    source = meta.get("source")
+    return (meta.get("thread_source") in ("subagent", "guardian_review")
+            or (isinstance(source, dict) and ("subagent" in source
+                                              or "thread_spawn" in source))
+            or bool(meta.get("parent_thread_id")))
+
+
 def list_sessions() -> list[tuple[Path, str, str]]:
     """This project's Claude and Codex sessions, newest first by last activity
     (see last_activity: a reopened old chat's mtime moves, its records don't)."""
@@ -321,8 +331,8 @@ def list_sessions() -> list[tuple[Path, str, str]]:
         meta = _codex_meta(path)
         cwd, sid = meta.get("cwd"), meta.get("id")
         if isinstance(cwd, str) and isinstance(sid, str) \
-                and _same_directory(cwd, os.getcwd()):
-            sessions.append((path, "codex", sid))
+                and _same_directory(cwd, os.getcwd()) and not _codex_side_thread(meta):
+            sessions.append((path, "codex", sid))  # side threads: by id only
     sessions.sort(key=lambda item: last_activity(item[0]), reverse=True)
     return sessions
 
@@ -1395,7 +1405,8 @@ def _transcript_body(records: list[dict], show_tools: bool, provider: str,
 
     A message is one user prompt (`## 👤 User`), or the assistant's whole reply
     to it: every `## 🤖 <assistant>` and `## 📋 Plan` block up to the next
-    prompt, with their `🔧 tools:` lines. A reply often runs to a dozen blocks,
+    prompt, with their `🔧 tools:` lines — including tools run before the
+    first text, and a reply of nothing but tools. A reply often runs to a dozen blocks,
     so counting blocks would let the cut swallow the user's last ask. With
     `messages`, only the first and last that many are kept, with a marker for
     the cut.
@@ -1408,7 +1419,15 @@ def _transcript_body(records: list[dict], show_tools: bool, provider: str,
     def flush_tools():
         if show_tools and pending_tools:
             compact = ", ".join(_compact_tool_labels(pending_tools))
-            (groups[-1][1] if groups else lead).append(f"_🔧 tools: {compact}_\n")
+            line = f"_🔧 tools: {compact}_\n"
+            if not groups:
+                lead.append(line)
+            else:
+                # Tools run right after a prompt open the reply to it (which
+                # may be nothing but tools), rather than tail the prompt.
+                if groups[-1][0] == "user":
+                    groups.append(("assistant", []))
+                groups[-1][1].append(line)
         pending_tools.clear()
 
     def add(side: str, line: str):
@@ -1688,10 +1707,11 @@ def resolve_excludes(values: list[str], candidates: list[tuple[Path, str, str]]
             print(f"--exclude {CURRENT_SESSION}: {value} ({note})", file=sys.stderr)
         key = value.lower()
         matches = [sid for sid in known if sid == key] \
-            or [sid for sid in known if key and sid.startswith(key)]
+            or [sid for sid in known if len(key) >= 4 and sid.startswith(key)]
         if len(matches) != 1:
-            why = (f"matches {len(matches)} sessions, give more of the id"
-                   if matches else "matches no session in this project")
+            why = (f"matches {len(matches)} sessions, give more of the id" if matches
+                   else "too short, give at least 4 characters of the id"
+                   if len(key) < 4 else "matches no session in this project")
             print(f"--exclude {raw}: {why}; ignored", file=sys.stderr)
             continue
         excluded.add(matches[0])
@@ -1710,7 +1730,7 @@ def _has_messages(session: Session) -> bool:
 _FAMILY_COMMAND_RE = re.compile(r"\A[/$](?:[\w.-]+:)?(?:resume|recap|export)-lite\Z")
 # What their arguments look like: ids or prefixes, counts, `this`, flags.
 _FAMILY_ARG_RE = re.compile(
-    r"\A(?:[0-9a-f-]{6,36}|\d+|this|--?[a-z][\w-]*(?:=\S*)?)\Z", re.I)
+    r"\A(?:[0-9a-f-]{8,36}|\d+|this|--?[a-z][\w-]*(?:=\S*)?)\Z", re.I)  # id: 8+
 _FAMILY_VALUE_FLAGS = frozenset({"--to", "--out", "--exclude", "--messages",
                                  "--provider", "--recent"})
 _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
@@ -1907,8 +1927,8 @@ def main() -> None:
             "this\nproject, Claude Code and Codex together (or --provider "
             "claude|codex),\nnewest first by last recorded activity (not file "
             "mtime). Passed over:\n"
-            "  - each --exclude ID: a full id, a unique prefix (the 8-char "
-            "short id\n    works) or `this`; repeatable; one that matches no "
+            "  - each --exclude ID: a full id, a unique prefix of 4+ chars (the "
+            "8-char\n    short id works) or `this`; repeatable; one that matches no "
             "session, or\n    several, is reported on stderr and ignored\n"
             "  - sessions with no conversation at all\n"
             "  - sessions whose every prompt only ran /resume-lite, "
@@ -1926,7 +1946,8 @@ def main() -> None:
             "whole. A message is\none user prompt (## 👤 User), or the "
             "assistant's whole reply to it:\nevery ## 🤖 Claude / Codex and "
             "## 📋 Plan block up to the next prompt,\nwith their 🔧 tools "
-            "lines. It needs ids or --recent. Trimmed files get\n-m<M> in "
+            "lines (tools alone make a reply too). It needs ids\nor --recent. "
+            "Trimmed files get -m<M> in "
             "their name (summary-m5.md, recent-m5.md,\n"
             "<date>-<topic>-<id8>-m5.md), so they never replace a full one; "
             "--out FILE\nis still exact."),
