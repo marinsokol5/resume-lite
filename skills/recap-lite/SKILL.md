@@ -22,7 +22,10 @@ since it scopes sessions to the working directory.
 
 ## Steps
 
-1. **Run session-transcript script**:
+1. **Run session-transcript script** — unless the user gave session ids
+   (`/recap-lite <id>`): this skill picks sessions by recency, so point them to
+   `/resume-lite <id>` to continue one or `/export-lite <id>` to keep it, and
+   stop.
    `python3 scripts/session-transcript --recent <N> --exclude <current>`
    - **`<N>`** — the count the user gave, else `3`.
    - **`<current>`** leaves out this session. Claude Code fills in its id
@@ -38,13 +41,15 @@ since it scopes sessions to the working directory.
    than asked, sessions passed over because they only ran these skills — are
    worth a short mention to the user.
 
-2. **Read the whole file** (page through it if it's long). Read in full, a
-   large session can cost up to ~15k tokens; if the user wants it cheaper,
-   `--messages 5` keeps just how each one started and ended.
+2. **Read the whole file** (page through it if it's long). A session is
+   usually a few thousand tokens read in full, the largest ~60k. If the file is
+   very long, suggest `--messages 5` — just how each session started and
+   ended — as the cheap read.
 
 3. **Write the recap**, newest first, one entry per session:
-   - **date** (when it was last active) · **provider** · **id8** — 1–2 lines
-     on what it was about and where it ended.
+   - **last active** (the local time on its line in the file's index) ·
+     **provider** · **id8** — 1–2 lines on what it was about and where it
+     ended.
 
    Then a short **Still in flight** list: open threads and obvious next steps
    across the sessions, each with the id of the session it comes from. Close

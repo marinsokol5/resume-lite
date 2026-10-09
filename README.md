@@ -76,6 +76,10 @@ in the same single file, so naming the most recent chat is enough:
 It's deterministic, not a guess: a chat started with `/resume-lite <id>` records
 that id in its own transcript, so the parser reads it straight back out.
 
+An id can be shortened to its first 8 or more characters — the short id a
+recap shows — as long as only one session starts that way (here, and for
+export-lite).
+
 ## export-lite
 
 **Keep** a session instead of resuming it: the transcript is written into the
@@ -119,8 +123,8 @@ an export doesn't make the exporting chat count as resumed from it for `--deep`.
 
 **Catch up** on what's been happening in this project: the most recent Claude
 Code and Codex sessions go into one transcript, which the agent reads to tell
-you, per session, its date, provider and short id, what it was about and where
-it ended — then a short list of what's still in flight, each item with the id
+you, per session, when it was last active (local time), its provider and
+short id, what it was about and where it ended — then a short list of what's still in flight, each item with the id
 to `/resume-lite`. It reports and waits; it doesn't act on any of it.
 
 ```
@@ -140,8 +144,8 @@ to `/resume-lite`. It reports and waits; it doesn't act on any of it.
 - **`--messages M`** keeps the first and last M messages of each session. A
   message is one prompt, or the assistant's whole reply to it (all its text
   and tool lines up to the next prompt), so the cut never splits a reply.
-  Read in full, a large session costs up to ~15k tokens; `--messages` is the
-  cheaper read.
+  Read in full, a session is usually a few thousand tokens, the largest
+  ~60k; `--messages 5` is the cheap read.
 
 ## Run the parser directly
 
@@ -161,7 +165,8 @@ Flags: `--deep` (add the chain they were resumed from), `--no-tools` (drop the
 tool trace), `--stdout` (also print it), `--save` (keep it in `transcripts/`),
 `--out <path>` / `--to <path>` (file = exact name; directory = auto-name
 inside it). Run from an agent's shell, `this` stands for that agent's own
-session (read from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`).
+session (read from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`). An id can
+be any unique prefix of 8+ characters.
 
 Instead of ids, `--recent N` takes the N most recent sessions (newest first,
 by last activity), passing over Codex side threads, empty sessions and ones
