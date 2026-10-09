@@ -116,8 +116,10 @@ reads the transcript back, so exporting costs the conversation next to nothing.
   that name (a different session, another combination, a recap, a trimmed or
   `--no-tools` copy, an export you've added notes to, a file of your own) is
   left alone, and the new export takes `-2`, `-3`, …
-- **A path** ending in `.md` is used exactly as given (no date), replacing
-  only an earlier transcript there. A directory — one that exists, or any path
+- **A path** ending in `.md` is used exactly as given (no date). It replaces
+  a file there only if that's an earlier export of the same session(s) that
+  the new one just extends — never another session's, one you've added notes
+  to, or any other file. A directory — one that exists, or any path
   ending in `/` (created) — gets `<date>-<topic>.md` inside it, by the same
   rules.
 - **Topics in any language** are spelled out in plain letters

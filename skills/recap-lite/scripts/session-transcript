@@ -1819,13 +1819,27 @@ def transcript_signature(lines) -> tuple | None:
 
 
 def _body(lines: list[str]) -> list[str]:
-    """A transcript's lines below its header, minus the meta lines (turn
-    counts, time spans) that change as a session grows."""
+    """A transcript's lines below its header, minus each session's meta line
+    (turn counts, time spans: they change as a session grows). Only that line,
+    under a `# Session …` heading, is skipped: one the user wrote stays."""
     end = lines.index("---") if "---" in lines else len(lines)
-    body = [line for line in lines[end + 1:] if not line.startswith("_Source: ")]
+    body: list[str] = []
+    for line in lines[end + 1:]:
+        heading = next((kept for kept in reversed(body[-2:]) if kept.strip()), "")
+        if line.startswith("_Source: ") and heading.startswith("# Session ") \
+                and (body[-1] == heading or not body[-1].strip()):
+            continue
+        body.append(line)
     while body and not body[-1].strip():
         body.pop()
     return body
+
+
+def _before_cut(lines: list[str]) -> list[str]:
+    """A trimmed transcript up to its first `✂️` marker: the opening messages,
+    which stay put while the omitted count and the last ones move on."""
+    cut = next((i for i, line in enumerate(lines) if line.startswith("## ✂️")), None)
+    return lines if cut is None else lines[:cut]
 
 
 def replaceable(path: Path, transcript: str) -> bool:
@@ -1833,15 +1847,19 @@ def replaceable(path: Path, transcript: str) -> bool:
     earlier export of the same thing, and the new one only adds to it. Notes
     the user wrote into it, or another session, make it not."""
     new = transcript.splitlines()
-    if not path.is_file() or _file_signature(path) != transcript_signature(new):
+    signature = transcript_signature(new)
+    if not path.is_file() or _file_signature(path) != signature:
         return False
     try:
         old = _body(path.read_text(encoding="utf-8").splitlines())
     except (OSError, UnicodeDecodeError):
         return False
+    new = _body(new)
+    if signature and signature[2] is not None:  # trimmed: compare the openings
+        old, new = _before_cut(old), _before_cut(new)
     if old and old[-1].startswith("_🔧 tools: "):
         old.pop()  # a turn still running when it was exported gains more tools
-    return _body(new)[:len(old)] == old
+    return new[:len(old)] == old
 
 
 def _file_signature(path: Path) -> tuple | None:
@@ -1861,9 +1879,9 @@ def claim_name(path: Path, transcript: str) -> Path:
     and the name takes the first free `-2`, `-3`, ….
     """
     candidate, number = path, 1
-    while candidate.exists():
-        if replaceable(candidate, transcript):
-            return candidate
+    while os.path.lexists(candidate):  # a dangling link is taken too
+        if not candidate.is_symlink() and replaceable(candidate, transcript):
+            return candidate  # never written through a link
         number += 1
         candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
     return candidate
@@ -1887,11 +1905,14 @@ def out_path(target: str, sessions: list[Session], topic: str | None = None,
     if topic is not None:
         print(f"--topic {topic!r} ignored: {target} is an exact file name",
               file=sys.stderr)
-    if path.exists() and transcript is not None and (
-            not path.is_file() or _file_signature(path) is None):
-        sys.exit(f"{target} already exists and isn't a session transcript: not "
-                 "replacing it (give another file name, or a directory/ to get "
-                 "<date>-<topic>.md inside it)")
+    if transcript is not None and os.path.lexists(path) \
+            and not replaceable(path, transcript):
+        what = ("isn't an earlier export of this: another session's, or one with "
+                "notes added" if _file_signature(path) else
+                "isn't a session transcript")
+        sys.exit(f"{target} already exists and {what}: not replacing it (give "
+                 "another file name, or a directory/ to get <date>-<topic>.md "
+                 "inside it)")
     return path
 
 

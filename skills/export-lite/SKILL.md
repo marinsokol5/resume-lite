@@ -57,8 +57,9 @@ since it scopes sessions to the working directory.
      digit word (a commit hash, `20261009`): run again with it as a topic word;
    - **a missing or ambiguous id** otherwise — relay the reason and ask the
      user to confirm;
-   - **it won't replace a file** that exists and isn't a transcript — never
-     work around that; ask for another path (or drop it and use `--save`);
+   - **it won't replace a file** that's there already (not an earlier export
+     of these sessions) — never work around that; ask for another path, or
+     drop it and use `--save`;
    - **it can't tell which session is `this`** — run it with no arguments to
      list this project's sessions, take the newest, and tell the user which id
      you picked.

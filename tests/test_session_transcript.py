@@ -334,7 +334,9 @@ class OutputTests(unittest.TestCase):
         self.assert_rejected(path, "--to", "README.md", message="isn't a session transcript")
         self.assertEqual(exact.read_text(encoding="utf-8"), "my own notes\n")
         kept = self.invoke(path, "--to", "kept.md")
-        self.assertEqual(self.invoke(self.paths[0], "--to", "kept.md"), kept)
+        self.assertEqual(self.invoke(path, "--to", "kept.md"), kept)  # its own export
+        self.assert_rejected(self.paths[0], "--to", "kept.md",
+                             message="another session's, or one with notes added")
 
     def test_topic_names_the_file(self):
         ids = [f"d{i:07x}-2222-4222-8222-{i:012x}" for i in range(1, 3)]
@@ -370,6 +372,49 @@ class OutputTests(unittest.TestCase):
         bare = self.invoke(path, "--save", "--no-tools")
         self.assertEqual(bare, first.with_name(first.stem + "-3.md"))
         self.assertEqual(TRANSCRIPT["_file_signature"](bare)[-1], "no-tools")
+
+    def test_exact_paths_follow_the_same_rule(self):
+        sid = "e4000001-2222-4222-8222-000000000001"
+        path = self.write_session(sid, 12, "Plan")
+        kept = self.invoke(path, "--to", "plan.md")
+        self.write_session(sid, 12, "Plan", more=[("next?", "step two")])
+        self.assertEqual(self.invoke(path, "--to", "plan.md"), kept)  # grew: refreshed
+        with kept.open("a", encoding="utf-8") as stream:
+            stream.write("\n_Source: my own reading notes\n")  # looks like ours, isn't
+        self.assert_rejected(path, "--to", "plan.md", message="one with notes added")
+        self.assertIn("my own reading notes", kept.read_text(encoding="utf-8"))
+        # Auto names too: that line is the user's, so the re-export takes -2.
+        saved = self.invoke(path, "--save")
+        with saved.open("a", encoding="utf-8") as stream:
+            stream.write("\n_Source: my own reading notes\n")
+        self.assertEqual(self.invoke(path, "--save"), saved.with_name(saved.stem + "-2.md"))
+
+    def test_trimmed_reexports_refresh_in_place(self):
+        sid = "e5000001-2222-4222-8222-000000000001"
+        turns = [(f"ask {i}", f"answer {i}") for i in range(4)]
+        path = self.write_session(sid, 13, "Long one", more=turns)
+        first = self.invoke(path, "--save", "--messages", 1)
+        self.assertIn("## ✂️", first.read_text(encoding="utf-8"))
+        self.write_session(sid, 13, "Long one", more=turns + [("ask 4", "answer 4")])
+        self.assertEqual(self.invoke(path, "--save", "--messages", 1), first)
+        self.assertIn("answer 4", first.read_text(encoding="utf-8"))
+
+    def test_links_at_an_auto_name_are_never_written_through(self):
+        sid = "e6000001-2222-4222-8222-000000000001"
+        path = self.write_session(sid, 14, "Linked")
+        folder = self.root / "transcripts"
+        folder.mkdir()
+        outside = self.root / "outside.md"
+        (folder / "2026-09-14-linked.md").symlink_to(outside)  # dangling
+        out = self.invoke(path, "--save")
+        self.assertEqual(out, folder / "2026-09-14-linked-2.md")
+        self.assertFalse(outside.exists())
+        real = self.invoke(path, "--to", "real.md")  # an export, then a link to it
+        (folder / "2026-09-14-linked-2.md").unlink()
+        (folder / "2026-09-14-linked-2.md").symlink_to(real)
+        before = real.read_text(encoding="utf-8")
+        self.assertEqual(self.invoke(path, "--save"), folder / "2026-09-14-linked-3.md")
+        self.assertEqual(real.read_text(encoding="utf-8"), before)
 
     def test_a_running_turn_still_refreshes_its_export(self):
         # Exported mid-turn (this session, typically): later the same turn ran
@@ -536,7 +581,8 @@ class OutputTests(unittest.TestCase):
         for paths in (self.paths[:1], self.paths[:2]):
             with self.subTest(sessions=len(paths)):
                 self.assertIn(resume, self.invoke(*paths).read_text(encoding="utf-8"))
-                for flags in (["--save"], ["--out", "kept/"], ["--to", "kept.md"]):
+                for flags in (["--save"], ["--out", "kept/"],
+                              ["--to", f"kept-{len(paths)}.md"]):
                     text = self.invoke(*paths, *flags).read_text(encoding="utf-8")
                     self.assertIn(TRANSCRIPT["EXPORT_BLURB"], text)
                     self.assertNotIn(resume, text)
