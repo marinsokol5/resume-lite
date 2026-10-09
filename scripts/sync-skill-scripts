@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""
+sync-skill-scripts
+
+Copy the one real parser, skills/resume-lite/scripts/session-transcript, into
+every other skill under skills/ that has a SKILL.md, keeping the exec bit.
+
+Each skill ships its own copy rather than a symlink: `npx skills update`
+compares each skill folder's git tree hash, so a symlinked sibling would never
+see a script change, and a Windows checkout without core.symlinks gets a text
+file instead of a script. Edit only the resume-lite copy, then run this; the
+tests fail until the copies match.
+
+Usage:
+    scripts/sync-skill-scripts
+"""
+
+import filecmp
+import os
+import shutil
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parents[1]
+SOURCE = REPO / "skills" / "resume-lite" / "scripts" / "session-transcript"
+
+
+def main() -> None:
+    for skill_md in sorted((REPO / "skills").glob("*/SKILL.md")):
+        skill = skill_md.parent
+        if skill == SOURCE.parents[1]:
+            continue
+        target = skill / "scripts" / "session-transcript"
+        shown = target.relative_to(REPO)
+        if target.is_symlink():
+            target.unlink()  # copying onto a link would write through it
+        elif target.is_file() and os.access(target, os.X_OK) \
+                and filecmp.cmp(SOURCE, target, shallow=False):
+            print(f"up to date  {shown}")
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(SOURCE, target)  # copy2 keeps the mode, exec bit included
+        print(f"updated     {shown}")
+
+
+if __name__ == "__main__":
+    main()
