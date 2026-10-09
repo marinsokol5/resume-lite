@@ -52,7 +52,8 @@ since it scopes sessions to the working directory.
      ended.
 
    Then a short **Still in flight** list: open threads and obvious next steps
-   across the sessions, each with the id of the session it comes from. Close
+   across the sessions, each with the **full** id of the session it comes from
+   (the entries above can keep the id8). Close
    by noting that any of them can be picked up with `/resume-lite <id>`
    (`$resume-lite` in Codex).
 
