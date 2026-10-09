@@ -1,9 +1,13 @@
-# resume-lite Agent Skill
+# resume-lite Agent Skills
 
-Resume a **Claude Code or Codex** session from a
-deterministic transcript. Just the human ↔ agent
-back-and-forth and tools invocations,
-parsed from the session's saved JSONL. No LLM summary. No tokens spent. Near instant.
+Light, deterministic transcripts of **Claude Code and Codex** sessions. Just
+the human ↔ agent back-and-forth and tools invocations, parsed from the
+session's saved JSONL. No LLM summary. No tokens spent. Near instant.
+
+| Skill | Use it to |
+| ----- | --------- |
+| [`resume-lite`](#resume-lite) | pick a session back up where it left off |
+| [`export-lite`](#export-lite) | save a session's transcript into the project, to keep or commit |
 
 Because the output is a plain Markdown transcript, it's also a cross-provider
 handoff. Feed a Claude session to Codex, or a Codex session to Claude.
@@ -23,19 +27,26 @@ Random Claude Code session:
 
 ## Install
 
-Plain Agent Skill, needs Python 3.
+Plain Agent Skills, need Python 3.
 
 ```bash
-# Install via Agent Skills CLI
-npx skills add marinsokol5/resume-lite
+# Install all of them via Agent Skills CLI
+npx skills add marinsokol5/resume-lite --skill '*'
 
-# Later you can update it through
-npx skills update resume-lite
+# Or only the ones you want
+npx skills add marinsokol5/resume-lite --skill export-lite
+npx skills add marinsokol5/resume-lite --list   # what's in the repo
+
+# Later you can update them through
+npx skills update resume-lite export-lite
 ```
 
-## Use it
+Each works as `/name` in Claude Code and `$name` in Codex.
 
-As a skill (`/resume-lite` in Claude Code, `$resume-lite` in Codex):
+Used `/resume-lite --save`? Saving moved to export-lite:
+`npx skills add marinsokol5/resume-lite --skill export-lite`.
+
+## resume-lite
 
 ```
 /resume-lite <sessionId> [<sessionId> ...]
@@ -43,7 +54,8 @@ As a skill (`/resume-lite` in Claude Code, `$resume-lite` in Codex):
 
 It runs the bundled `session-transcript` parser, writes the transcript to
 `$TMPDIR/session-transcript/<sessionId>/summary.md`, reads it back, and gives a
-short orientation.
+short orientation. With no id, it lists this project's Claude and Codex
+sessions to pick from.
 
 Pass several ids and they're stitched into a **single** file, in the order
 given, each session under its own heading — one conversation continued across
@@ -63,26 +75,63 @@ in the same single file, so naming the most recent chat is enough:
 It's deterministic, not a guess: a chat started with `/resume-lite <id>` records
 that id in its own transcript, so the parser reads it straight back out.
 
-Or **keep** a session instead of resuming it — `--save` writes the transcript
-into the project, named to be recognizable in a repo listing, so it can be
-committed alongside the work it describes:
+## export-lite
+
+**Keep** a session instead of resuming it: the transcript is written into the
+project, named to be recognizable in a repo listing, so it can be committed
+alongside the work it describes. The skill reports the path and stops — it
+never reads the transcript back, so exporting costs the current conversation
+next to nothing.
 
 ```
-/resume-lite <sessionId> --save
-# transcripts/2026-09-07-support-multiple-session-ids-48f4b8ff.md
+/export-lite                        # list sessions, ask which
+/export-lite <id> [<id> ...]        # → transcripts/<date>-<topic>-<id8>.md
+/export-lite this                   # the current session
+/export-lite <id> --deep            # include the chain it was resumed from
+/export-lite <id> --to <path>       # file = exact name; directory = auto-name inside it
+/export-lite <id> --no-tools        # conversation only, no tool trace
 ```
 
-For several sessions, saved names also include `+<count>more-<hash>` so saving
-another combination with the same opening session preserves the earlier file.
+```
+/export-lite <sessionId>
+# transcripts/2026-09-07-let-s-support-multiple-session-ids-provided-one-48f4b8ff.md
+```
 
-Or run the parser directly:
+- **Naming.** Date and opening prompt of the first session, then its short id.
+  Several sessions add `+<n>more-<hash>`, where `<n>` counts the sessions after
+  the first (3 sessions → `+2more`), so another combination with the same
+  opening session doesn't replace the earlier file. With `--deep` the name
+  comes from the oldest session in the chain, not the one you named.
+- **Re-exporting** the same session(s) overwrites that same file — handy to
+  refresh an export once the session has moved on.
+- **`--to`** takes a file path as the exact name. A directory — one that
+  exists, or any path ending in `/` (created) — gets the auto-generated name
+  inside it: `--to notes/` → `notes/<date>-<topic>-<id8>.md`.
+- **`this`** is the session you're in. Claude Code hands the skill its id; in
+  Codex (or anywhere it isn't handed over) the parser reads it from
+  `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`.
+
+Exported files get a neutral header (no "continue the work" line), and running
+an export doesn't make the exporting chat count as resumed from it for `--deep`.
+
+## Run the parser directly
+
+It's bundled in each skill's folder as `scripts/session-transcript` — for a
+global install, `~/.agents/skills/resume-lite/scripts/session-transcript`. Run
+it from the project directory — sessions are scoped to the working directory.
+The transcript's path is the last line it prints.
 
 ```shell
-skills/resume-lite/scripts/session-transcript <sessionId> [<sessionId> ...]   # write the transcript, print its path
+~/.agents/skills/resume-lite/scripts/session-transcript                     # list this project's sessions
+~/.agents/skills/resume-lite/scripts/session-transcript <sessionId> [...]   # write ONE transcript, print its path
+~/.agents/skills/resume-lite/scripts/session-transcript <sessionId> --save  # keep it in transcripts/
 ```
 
-Flags: `--no-tools` (drop the tool trace), `--stdout` (also print it),
-`--save` (keep it in `transcripts/`), `--out <file>` (override the path).
+Flags: `--deep` (add the chain they were resumed from), `--no-tools` (drop the
+tool trace), `--stdout` (also print it), `--save` (keep it in `transcripts/`),
+`--out <path>` / `--to <path>` (file = exact name; directory = auto-name
+inside it). Run from an agent's shell, `this` stands for that agent's own
+session (read from `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`).
 
 
 ## How it works
@@ -125,3 +174,14 @@ Created worktree `/Users/marinsokol/projects/codex-support` on branch `codex-sup
 ```
 
 It's a memory jog, not a full replay.
+
+## Contributing
+
+- One parser serves every skill, and each skill ships its own copy of it. Edit
+  only `skills/resume-lite/scripts/session-transcript`, then run
+  `scripts/sync-skill-scripts` to copy it into the others. Copies, not
+  symlinks: `npx skills update` compares each skill folder's git tree hash, so
+  a symlinked sibling would never pick up a change.
+- Tests: `python3 -m unittest discover -s tests` (they also fail when a copy
+  has drifted).
+- Token counts like the table above: `eval/anthropic-evaluate <sessionId>`.
