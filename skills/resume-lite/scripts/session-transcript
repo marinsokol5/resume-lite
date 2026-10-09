@@ -20,6 +20,7 @@ Usage:
         [--deep]                 # also include what these resumed from
         [--save]                 # keep it in the project (see below)
         [--out|--to <path>]      # override output path (a dir gets the --save name)
+        [--topic TEXT]           # name a kept transcript after TEXT
         [--tools | --no-tools]   # show/hide the tool trace (default: show)
         [--stdout]               # also print the transcript to stdout
         [--messages M]           # keep each session's first and last M messages
@@ -46,7 +47,9 @@ Default output is throwaway, under the OS temp dir:
 
 --save instead writes a keepable transcript into the project, named to be
 recognizable in a repo listing (and committed):
-    transcripts/<date>-<opening prompt>-<id8>.md
+    transcripts/<date>-<opening prompt>.md
+(saving the same session(s) again overwrites it; a different one with the
+same name takes -2, -3, ...)
 
 --out (alias --to) takes a file path as the exact name. A directory (one that
 exists, or a path ending in a separator, which is created) gets that --save
@@ -62,8 +65,8 @@ providers, newest first by last activity, minus any --exclude and sessions
 that only ran this skill family), one file under
     $TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md
 --messages M keeps only each session's first and last M messages (a message
-is a user prompt, or the assistant's whole reply to it); trimmed files are
-named `-m<M>`.
+is a user prompt, or the assistant's whole reply to it); trimmed temp files
+are named `-m<M>`.
 
 The output file path is printed to stdout as the last line.
 """
@@ -1737,29 +1740,91 @@ def _local_date(stamp: str) -> str:
 
 
 def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR,
-                  suffix: str = "") -> Path:
+                  topic: str | None = None) -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
     Named for a human scanning a repo listing, not for a machine: the date and
-    the opening prompt are what you recognize it by months later. The short id
-    keeps two same-day sessions apart and maps the file back to its session.
+    the opening prompt of the first session are what you recognize it by
+    months later — or the topic the user gave, which names it better. Two
+    exports can share a name; claim_name settles it.
     """
     session = sessions[0]
     stamps = _timestamps(session.records)
     date = (_local_date(stamps[0]) if stamps else
             datetime.date.fromtimestamp(session.path.stat().st_mtime).isoformat())
-    topic = first_user_snippet(session.path, session.provider, limit=120,
-                               skip_commands=True)
-    slug = _slugify(_SESSION_ID_RE.sub(" ", topic)) or "session"
-    name = f"{date}-{slug}-{session.id[:8]}"
-    if len(sessions) > 1:
-        name += (f"+{len(sessions) - 1}more-"
-                 f"{_session_ids_hash([s.id for s in sessions])}")
-    return Path(directory) / f"{name}{suffix}.md"
+    slug = _slugify(topic or "")
+    if not slug:
+        opening = first_user_snippet(session.path, session.provider, limit=120,
+                                     skip_commands=True)
+        slug = _slugify(_SESSION_ID_RE.sub(" ", opening)) or "session"
+    return Path(directory) / f"{date}-{slug}.md"
 
 
-def out_path(target: str, sessions: list[Session], suffix: str = "") -> Path:
-    """--out: a file path is the exact name; a directory gets the --save name.
+_TITLE = "# Session transcript — "
+
+
+def transcript_signature(lines) -> tuple | None:
+    """What a transcript of ours holds, read from its header (the lines up to
+    the first `---`): (single|combined|recap, its session ids in order, the
+    --messages count or None). None for any other file."""
+    header = []
+    for line in lines:
+        if line.rstrip("\n") == "---":
+            break
+        header.append(line.rstrip("\n"))
+        if len(header) > 5000:  # no header of ours runs this long
+            return None
+    else:
+        return None  # never reached the `---` that ends every header of ours
+    if not header or not header[0].startswith(_TITLE) \
+            or not any(line.startswith("_Source: ") for line in header):
+        return None
+    title = header[0][len(_TITLE):]
+    text = "\n".join(header)
+    trim = re.search(r"^> Trimmed with --messages (\d+):", text, re.MULTILINE)
+    messages = int(trim.group(1)) if trim else None
+    single = re.fullmatch(r"`([^`\s]+)`", title)
+    if single:
+        return "single", (single.group(1),), messages
+    ids = tuple(re.findall(r"^\d+\. `([^`\s]+)` — ", text, re.MULTILINE))
+    if not ids:
+        return None
+    if re.fullmatch(r"\d+ most recent (?:Claude Code |Codex )?sessions?", title):
+        return "recap", ids, messages
+    if re.fullmatch(r"\d+ sessions combined", title):
+        return "combined", ids, messages
+    return None
+
+
+def _file_signature(path: Path) -> tuple | None:
+    try:
+        return transcript_signature(_lines(path))
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def claim_name(path: Path, transcript: str) -> Path:
+    """An auto-generated name (date + topic) to write `transcript` to.
+
+    Exporting the same thing again (same session ids, same kind of transcript,
+    same --messages) overwrites the earlier file; anything else already there,
+    including a file that isn't one of our transcripts, is left alone and the
+    name takes the first free `-2`, `-3`, ….
+    """
+    mine = transcript_signature(transcript.splitlines())
+    candidate, number = path, 1
+    while candidate.exists():
+        if candidate.is_file() and _file_signature(candidate) == mine:
+            return candidate
+        number += 1
+        candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
+    return candidate
+
+
+def out_path(target: str, sessions: list[Session], topic: str | None = None,
+             transcript: str | None = None) -> Path:
+    """--out: a file path is the exact name; a directory gets the --save name
+    (settled by claim_name when the transcript to write is given).
 
     A directory is one that already exists, or a path ending in a separator
     (created on write), so `--out notes/` can't quietly become a file `notes`.
@@ -1769,7 +1834,8 @@ def out_path(target: str, sessions: list[Session], suffix: str = "") -> Path:
     if target.endswith(separators) and path.exists() and not path.is_dir():
         sys.exit(f"{target}: not a directory")
     if target.endswith(separators) or path.is_dir():
-        return save_out_path(sessions, path, suffix)
+        named = save_out_path(sessions, path, topic)
+        return claim_name(named, transcript) if transcript is not None else named
     return path
 
 
@@ -2074,11 +2140,15 @@ def main() -> None:
             "  $TMPDIR/session-transcript/<id1+id2+...>-<hash>/combined.md (several)\n\n"
             "--save keeps it in the project instead, under a name you can "
             "recognize\nin a repo listing:\n"
-            "  transcripts/<date>-<opening prompt>-<id8>.md\n\n"
+            "  transcripts/<date>-<opening prompt>.md      (--topic TEXT names it "
+            "instead)\n"
+            "Saving the same session(s) again overwrites that file; anything "
+            "else\nalready there under the name (another session, any other "
+            "file) is\nleft alone and the new one takes -2, -3, ...\n\n"
             "--out PATH (alias --to) writes to PATH exactly; if PATH is a "
             "directory\n(exists, or ends in /, created) the --save name goes "
             "inside it:\n"
-            "  --out notes/  ->  notes/<date>-<opening prompt>-<id8>.md\n\n"
+            "  --out notes/  ->  notes/<date>-<opening prompt>.md\n\n"
             "--recent N takes the place of ids: the N most recent sessions in "
             "this\nproject, Claude Code and Codex together (or --provider "
             "claude|codex),\nnewest first by last recorded activity (not file "
@@ -2094,19 +2164,17 @@ def main() -> None:
             "Fewer than N is fine; none is an error. It takes no ids and no "
             "--deep,\nand writes one recap file with a neutral header:\n"
             "  $TMPDIR/session-transcript/recent-<id1+id2+...>-<hash>/recent.md\n"
-            "Kept with --save or --to DIR/, the name gets -recent "
-            "(<date>-<topic>-<id8>\n+<n>more-<hash>-recent.md), so it never "
-            "replaces an export of those ids.\n\n"
+            "Kept with --save or --to DIR/, it's named like an export; one of "
+            "the same\nfirst session takes -2 rather than replace it.\n\n"
             "--messages M keeps the first M and last M messages of each "
             "session and\nmarks the cut; a session with 2M or fewer is kept "
             "whole. A message is\none user prompt (## 👤 User), or the "
             "assistant's whole reply to it:\nevery ## 🤖 Claude / Codex and "
             "## 📋 Plan block up to the next prompt,\nwith their 🔧 tools "
             "lines (tools alone make a reply too). It needs ids\nor --recent. "
-            "Trimmed files get -m<M> in "
-            "their name (summary-m5.md, recent-m5.md,\n"
-            "<date>-<topic>-<id8>-m5.md), so they never replace a full one; "
-            "--out FILE\nis still exact."),
+            "Trimmed temp files get -m<M> in their name (summary-m5.md,\n"
+            "recent-m5.md), so they never replace a full one; a kept one is "
+            "told apart\nby its header (see --save)."),
     )
     ap.add_argument("sessions", nargs="*", metavar="session",
                     help="session id(s), or `this` for the current session; "
@@ -2117,7 +2185,10 @@ def main() -> None:
                             "path; a directory (existing, or ending in /) gets "
                             "the --save name inside it")
     where.add_argument("--save", action="store_true",
-                       help=f"keep it in the project: {SAVE_DIR}/<date>-<topic>-<id>.md")
+                       help=f"keep it in the project: {SAVE_DIR}/<date>-<topic>.md")
+    ap.add_argument("--topic", metavar="TEXT",
+                    help="with --save or --to DIR/: name the file after TEXT "
+                         "instead of the opening prompt")
     ap.add_argument("--deep", action="store_true",
                     help="also pull in the sessions these were resumed from, "
                          "transitively (follows /resume-lite invocations)")
@@ -2152,6 +2223,8 @@ def main() -> None:
                      "doesn't combine with --recent")
     elif args.provider or args.exclude:
         ap.error("--provider and --exclude only go with --recent")
+    if args.topic is not None and not keep:
+        ap.error("--topic names a kept transcript: use it with --save or --to DIR/")
     if (keep or args.messages) and not args.sessions and not recent:
         flags = "--save/--out/--to need" if keep else "--messages needs"
         ap.error(f"{flags} a session id or --recent "
@@ -2187,10 +2260,9 @@ def main() -> None:
     else:
         sessions, parents = _explicit_sessions(args.sessions, args.deep)
 
-    # Trimmed files get their own name, so they never replace a full one; nor
-    # does a recap saved into the project replace an export of the same ids.
+    # Trimmed temp files get their own name, so they never replace a full one.
+    # (Kept ones don't need it: their header tells claim_name they differ.)
     suffix = f"-m{args.messages}" if args.messages else ""
-    save_suffix = ("-recent" if recent else "") + suffix
     # A recap is read to be summarized, not continued: keep its header neutral.
     blurb = EXPORT_BLURB if keep or recent else BLURB
     if recent:
@@ -2224,9 +2296,9 @@ def main() -> None:
     # thing into context at once). Writing a file lets the agent Read it with
     # pagination/offset and re-read spans on demand. Keep this file-first.
     if args.save:
-        out = save_out_path(sessions, suffix=save_suffix)
+        out = claim_name(save_out_path(sessions, topic=args.topic), transcript)
     elif args.out is not None:
-        out = out_path(args.out, sessions, save_suffix)
+        out = out_path(args.out, sessions, args.topic, transcript)
     else:
         out = default_out
     try:

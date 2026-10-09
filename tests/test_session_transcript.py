@@ -258,7 +258,7 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(out.name, "summary.md")
         self.assertEqual(out.parent.name, IDS[0])
         saved = self.invoke(self.paths[0], "--save")
-        self.assertRegex(saved.name, r"^2026-09-0[12]-topic-0-00000001\.md$")
+        self.assertRegex(saved.name, r"^2026-09-0[12]-topic-0\.md$")
         self.assertEqual(saved.parent, self.root / "transcripts")
 
     def test_out_to_a_directory_uses_the_save_name(self):
@@ -278,6 +278,100 @@ class OutputTests(unittest.TestCase):
         combined = self.invoke(self.paths[0], self.paths[1], "--save").name
         self.assertEqual(self.invoke(self.paths[0], self.paths[1], "--out", "fresh/"),
                          self.root / "fresh" / combined)
+
+    def write_session(self, sid, day, topic, reply="ok"):
+        """A Codex session started on 2026-09-<day> with `topic` (or no prompt)."""
+        records = [{"type": "session_meta", "timestamp": f"2026-09-{day:02d}T12:00:00Z",
+                    "payload": {"id": sid, "cwd": str(self.root)}}]
+        if topic:
+            records.append({"type": "event_msg", "payload": {
+                "type": "user_message", "message": topic}})
+        records.append({"type": "event_msg", "payload": {
+            "type": "agent_message", "message": reply}})
+        path = self.root / f"{sid}.jsonl"
+        path.write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+        return path
+
+    def test_save_names_and_collisions(self):
+        ids = [f"a{i:07x}-2222-4222-8222-{i:012x}" for i in range(1, 5)]
+        paths = [self.write_session(sid, 5, "Fix the parser") for sid in ids[:3]]
+        names = [self.invoke(path, "--save") for path in paths]
+        base = self.root / "transcripts" / "2026-09-05-fix-the-parser.md"
+        self.assertEqual(names, [base, base.with_name(base.stem + "-2.md"),
+                                 base.with_name(base.stem + "-3.md")])
+        # Re-exporting a session refreshes its own file, wherever it landed.
+        self.write_session(ids[1], 5, "Fix the parser", reply="now with more")
+        self.assertEqual(self.invoke(paths[1], "--save"), names[1])
+        self.assertIn("now with more", names[1].read_text(encoding="utf-8"))
+        for name, sid in zip(names, ids):
+            self.assertEqual(TRANSCRIPT["_file_signature"](name), ("single", (sid,), None))
+        # --to DIR/ follows the same rule; an exact --to FILE stays exact.
+        kept = [self.invoke(path, "--to", "kept/") for path in paths[:2]]
+        self.assertEqual([p.name for p in kept], [base.name, base.stem + "-2.md"])
+        self.assertEqual(self.invoke(paths[0], "--to", "kept/"), kept[0])
+
+    def test_a_file_that_is_not_ours_is_never_overwritten(self):
+        sid = "b0000001-2222-4222-8222-000000000001"
+        path = self.write_session(sid, 6, "Notes")
+        target = self.root / "transcripts" / "2026-09-06-notes.md"
+        target.parent.mkdir()
+        for content in ("my own notes\n", f"# Session transcript — `{sid}`\nbut no header end"):
+            with self.subTest(content=content):
+                target.write_text(content, encoding="utf-8")
+                for leftover in target.parent.glob("*-2.md"):
+                    leftover.unlink()
+                self.assertEqual(self.invoke(path, "--save"),
+                                 target.with_name("2026-09-06-notes-2.md"))
+                self.assertEqual(target.read_text(encoding="utf-8"), content)
+        exact = self.root / "mine.md"
+        exact.write_text("my own notes\n", encoding="utf-8")
+        self.assertEqual(self.invoke(path, "--to", "mine.md"), exact)  # as asked
+        self.assertNotEqual(exact.read_text(encoding="utf-8"), "my own notes\n")
+
+    def test_topic_names_the_file(self):
+        ids = [f"d{i:07x}-2222-4222-8222-{i:012x}" for i in range(1, 3)]
+        paths = [self.write_session(sid, 8, f"opening {i}") for i, sid in enumerate(ids)]
+        topic = "Add export-lite & recap-lite skills!"
+        first = self.invoke(paths[0], "--save", "--topic", topic)
+        self.assertEqual(first.name, "2026-09-08-add-export-lite-recap-lite-skills.md")
+        self.assertEqual(self.invoke(paths[0], "--save", "--topic", topic), first)  # again
+        self.assertEqual(self.invoke(paths[1], "--save", "--topic", topic).name,
+                         "2026-09-08-add-export-lite-recap-lite-skills-2.md")
+        self.assertEqual(self.invoke(paths[0], "--to", "kept/", "--topic", "Kept!"),
+                         self.root / "kept" / "2026-09-08-kept.md")
+        long = self.invoke(paths[0], "--save", "--topic", "word " * 30).stem
+        self.assertLessEqual(len(long), len("2026-09-08-") + 48)
+        self.assertFalse(long.endswith("-"))
+        self.assertEqual(self.invoke(paths[0], "--save", "--topic", "!!!").name,
+                         "2026-09-08-opening-0.md")  # nothing left: the opening prompt
+        # An exact path stays exact, and a topic needs somewhere to name.
+        self.assertEqual(self.invoke(paths[0], "--to", "exact.md", "--topic", "x"),
+                         self.root / "exact.md")
+        self.assert_rejected(paths[0], "--topic", "x", message="--topic names a kept")
+
+    def test_no_topic_names_follow_the_same_rule(self):
+        ids = ["c0000001-2222-4222-8222-000000000001", "c0000002-2222-4222-8222-000000000002"]
+        names = [self.invoke(self.write_session(sid, 7, None), "--save") for sid in ids]
+        self.assertEqual([n.name for n in names],
+                         ["2026-09-07-session.md", "2026-09-07-session-2.md"])
+
+    def test_transcript_signature(self):
+        signature = TRANSCRIPT["transcript_signature"]
+        load = TRANSCRIPT["load_session"]
+        one = load(self.paths[0], "codex")
+        two = [one, load(self.paths[1], "codex")]
+        single = TRANSCRIPT["build_transcript"](one.records, one.id, True, "codex")
+        combined = TRANSCRIPT["build_combined"](two, True)
+        recap = TRANSCRIPT["build_combined"](
+            two, True, None, "> x\n> Trimmed with --messages 3: …", 3,
+            "2 most recent Codex sessions")
+        self.assertEqual(signature(single.splitlines()), ("single", (IDS[0],), None))
+        self.assertEqual(signature(combined.splitlines()), ("combined", tuple(IDS[:2]), None))
+        self.assertEqual(signature(recap.splitlines()), ("recap", tuple(IDS[:2]), 3))
+        for text in ("", "# Notes\n---\n", "# Session transcript — 2 sessions combined\n---\n",
+                     "# Session transcript — something else\n1. `x` — y\n---\n"):
+            with self.subTest(text=text):
+                self.assertIsNone(signature(text.splitlines()))
 
     def test_out_to_a_file_path_is_exact(self):
         for flag in ("--out", "--to"):
@@ -1157,7 +1251,7 @@ class RecentTests(unittest.TestCase):
                 self.assertEqual(out.parent.name, sid)  # named by the full id
                 self.assertIn(f"# Session transcript — `{sid}`", text)
         out, _, _ = self.recap(IDS[1][:8], "--save")
-        self.assertTrue(out.name.endswith(f"-{IDS[1][:8]}.md"))
+        self.assertEqual(TRANSCRIPT["_file_signature"](out), ("single", (IDS[1],), None))
         twins = ["abcdef12-1111-4111-8111-000000000001", "abcdef12-2222-4111-8111-000000000002"]
         for day, sid in enumerate(twins, 3):
             self.add(sid, "codex", day)
@@ -1305,15 +1399,19 @@ class RecentTests(unittest.TestCase):
     def test_recap_saves_never_replace_an_export(self):
         self.add(IDS[0], "claude", 1)
         self.add(IDS[1], "codex", 2)
+        # All named after the same first session: each kind keeps its own file.
         export, _, _ = self.recap(IDS[1], IDS[0], "--save")
         recap, _, _ = self.recap("--recent", 2, "--save")
-        self.assertEqual(recap, export.with_name(export.stem + "-recent.md"))
-        single_export, _, _ = self.recap(IDS[1], "--save")
-        single_recap, _, _ = self.recap("--recent", 1, "--to", "kept/")
-        self.assertEqual(single_recap.name, single_export.stem + "-recent.md")
+        self.assertEqual(recap, export.with_name(export.stem + "-2.md"))
+        single, _, _ = self.recap(IDS[1], "--save")
+        self.assertEqual(single, export.with_name(export.stem + "-3.md"))
+        self.assertEqual(self.recap("--recent", 2, "--save")[0], recap)  # again: same file
         trimmed, _, _ = self.recap("--recent", 2, "--save", "--messages", 1)
-        self.assertEqual(trimmed, export.with_name(export.stem + "-recent-m1.md"))
-        self.assertTrue(export.is_file() and single_export.is_file())
+        self.assertEqual(trimmed, export.with_name(export.stem + "-4.md"))
+        signature = TRANSCRIPT["_file_signature"]
+        self.assertEqual(signature(export), ("combined", (IDS[1], IDS[0]), None))
+        self.assertEqual(signature(recap), ("recap", (IDS[1], IDS[0]), None))
+        self.assertEqual(signature(trimmed), ("recap", (IDS[1], IDS[0]), 1))
 
     def test_messages_needs_ids_or_recent(self):
         self.add(IDS[0], "claude", 1)
@@ -1337,7 +1435,7 @@ class RecentTests(unittest.TestCase):
         self.assertEqual(text.count("## ✂️"), 1)
         saved, _, _ = self.recap(IDS[0], "--save")
         saved_trim, _, _ = self.recap(IDS[0], "--save", "--messages", 2)
-        self.assertEqual(saved_trim, saved.with_name(saved.stem + "-m2.md"))
+        self.assertEqual(saved_trim, saved.with_name(saved.stem + "-2.md"))  # by header
         exact, _, _ = self.recap(IDS[0], "--to", "exact.md", "--messages", 2)
         self.assertEqual(exact, self.project / "exact.md")
 
