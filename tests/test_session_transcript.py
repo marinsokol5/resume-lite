@@ -687,6 +687,90 @@ def turns(records):
             if kind != "tool"]
 
 
+NOTICE = ("<task-notification>\n<task-id>t1</task-id>\n<status>completed</status>\n"
+          f"<result>ran session-transcript {GHOST}</result>\n</task-notification>")
+REMINDER = ("<system-reminder>\nThe user started this session without choosing a "
+            "project folder.\n</system-reminder>")
+
+
+def claude_user(content, **extra):
+    return {"type": "user", "message": {"content": content}, **extra}
+
+
+def queued(prompt, kind="human", mode="prompt"):
+    return {"type": "attachment", "attachment": {
+        "type": "queued_command", "commandMode": mode, "origin": {"kind": kind},
+        "prompt": prompt}}
+
+
+class ClaudeHarnessTests(unittest.TestCase):
+    def turns(self, records):
+        return [(kind, text) for kind, text in
+                TRANSCRIPT["normalized_events"](records, "claude") if kind != "tool"]
+
+    def test_harness_text_is_not_a_user_turn(self):
+        records = [
+            claude_user(f"{REMINDER}\nwhat does this mean", origin={"kind": "human"}),
+            claude_user(NOTICE, origin={"kind": "task-notification"}),
+            claude_user(f"{NOTICE}\nThe cloud review produced these findings: []",
+                        origin={"kind": "task-notification"}),
+            queued(NOTICE, kind="task-notification", mode="task-notification"),
+            queued('<agent-message from="a1">\nreport\n</agent-message>', kind="peer"),
+            claude_user("<bash-input>git status</bash-input><bash-stdout>clean"
+                        "</bash-stdout><bash-stderr></bash-stderr>"),
+            queued("ss: and check the README too"),  # typed while Claude worked
+            queued("already a user record"), claude_user("already a user record"),
+            claude_user([{"type": "text", "text": REMINDER},
+                         {"type": "text", "text": "two blocks, one typed"}]),
+        ]
+        self.assertEqual(self.turns(records), [
+            ("user", "what does this mean"),
+            ("user", "!git status"),
+            ("user", "ss: and check the README too"),
+            ("user", "already a user record"),
+            ("user", "two blocks, one typed"),
+        ])
+
+    def test_the_same_tags_typed_by_the_user_are_kept(self):
+        for text in ("what does <system-reminder> do?",
+                     "<task-notification> blocks show up as turns, drop them",
+                     "parse <system-reminder>x</system-reminder> inline",
+                     "it wrote <system-reminder>x</system-reminder>",
+                     "<pasted_content id=\"a1\">\nmy notes\n</pasted_content>"):
+            with self.subTest(text=text):
+                self.assertEqual(self.turns([claude_user(text)]), [("user", text)])
+
+    def test_lineage_skips_notices_and_reads_queued_prompts(self):
+        records = [claude_user(NOTICE, origin={"kind": "task-notification"}),
+                   queued(f"/resume-lite {IDS[0]}")]
+        session = TRANSCRIPT["Session"](Path("x.jsonl"), "claude", IDS[7], records)
+        self.assertEqual(TRANSCRIPT["lineage_ids"](session), IDS[:1])
+
+    def test_short_ids_in_argument_lists_are_lineage(self):
+        self.assert_lineage(f"python3 ./session-transcript {IDS[0][:8]} {IDS[1][:8]}",
+                            [IDS[0][:8], IDS[1][:8]])
+        self.assert_lineage(f"python3 ./session-transcript {IDS[7][:8]}", [])  # itself
+        prompt = ("<command-name>/resume-lite</command-name>"
+                  f"<command-args>{IDS[0][:8]}</command-args>")
+        self.assertEqual(lineage(claude_user(prompt), "claude"), [IDS[0][:8]])
+        # Free typed text names a session only by its full id (8 hex chars
+        # there may be a commit), and prose to another agent names none.
+        self.assertEqual(lineage(claude_user(f"/resume-lite {IDS[0]} then 5b9d23b4"),
+                                 "claude"), IDS[:1])
+        for name, key in (("SendMessage", "message"), ("Agent", "prompt")):
+            record = {"type": "assistant", "message": {"content": [{
+                "type": "tool_use", "name": name,
+                "input": {key: f"run `session-transcript {IDS[0][:8]}` for me"}}]}}
+            with self.subTest(tool=name):
+                self.assertEqual(lineage(record, "claude"), [])
+
+    def assert_lineage(self, command, expected):
+        for provider in ("claude", "codex"):
+            with self.subTest(provider=provider, command=command):
+                self.assertEqual(lineage(tool_record(command, provider), provider),
+                                 expected)
+
+
 class CodexRolloutTests(unittest.TestCase):
     def test_old_tui_rollout(self):
         self.assertEqual(turns(old_tui_rollout()), [
@@ -1065,6 +1149,42 @@ class RecentTests(unittest.TestCase):
         out, _, _ = self.recap("ABCDEF12-2")
         self.assertEqual(out.parent.name, twins[1])
         self.assert_rejected("abcdef1", message="needs at least 8 characters")
+
+    def test_colliding_short_ids_prefer_user_threads_then_this_project(self):
+        def rollout(sid, cwd, day, **meta):
+            rows = codex_rollout(sid, cwd, "0.160.0", codex_user(f"task {day}"),
+                                 codex_reply("ok"))
+            rows[0]["payload"].update(meta)
+            for row in rows:
+                row["timestamp"] = f"2026-09-{day:02d}T12:00:00Z"
+            (self.codex / "sessions" / "2026" / f"rollout-x-{sid}.jsonl").write_text(
+                "\n".join(map(json.dumps, rows)) + "\n", encoding="utf-8")
+
+        user, side = "e0000000-1111-4111-8111-000000000001", "e0000000-2222-4111-8111-000000000002"
+        rollout(user, self.cwd, 1)
+        rollout(side, self.cwd, 2, thread_source="subagent", parent_thread_id=user,
+                source={"subagent": {"thread_spawn": {"parent_thread_id": user}}})
+        out, _, _ = self.recap("e0000000")
+        self.assertEqual(out.parent.name, user)  # not the subagent it spawned
+        here, there = "f0000000-1111-4111-8111-000000000001", "f0000000-2222-4111-8111-000000000002"
+        rollout(here, self.cwd, 3)
+        rollout(there, "/elsewhere", 4)
+        out, _, _ = self.recap("f0000000")
+        self.assertEqual(out.parent.name, here)  # this project's, not elsewhere
+        twin = "f0000000-3333-4111-8111-000000000003"
+        rollout(twin, self.cwd, 5)
+        self.assert_rejected("f0000000", message="is ambiguous")
+
+    def test_deep_follows_a_short_id_resume(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        command = {"type": "assistant", "timestamp": "2026-09-03T12:30:00Z", "message": {
+            "content": [{"type": "tool_use", "name": "Bash", "input": {
+                "command": f"python3 /s/session-transcript {IDS[0][:8]} {IDS[1][:8]}"}}]}}
+        self.add(IDS[2], "claude", 3, extra=[command])
+        _, text, err = self.recap(IDS[2], "--deep")
+        self.assertEqual(self.picked(text), [IDS[0], IDS[1], IDS[2]])
+        self.assertIn(f"--deep: {IDS[2][:8]} resumed from {IDS[0][:8]}", err)
 
     def test_deep_from_a_short_id_follows_full_ids(self):
         self.add(IDS[0], "claude", 1)

@@ -229,16 +229,45 @@ def _prefix_hits(prefix: str) -> list[tuple[Path, str]]:
     return unique
 
 
+def _in_this_project(path: Path, provider: str) -> bool:
+    if provider == "claude":
+        return path.parent == claude_project_dir()
+    cwd = _codex_meta(path).get("cwd")
+    return isinstance(cwd, str) and _same_directory(cwd, os.getcwd())
+
+
+def _narrow_prefix_hits(hits: list[tuple[Path, str]]) -> list[tuple[Path, str]]:
+    """Several sessions start with one short id (Codex ids are time-based, so
+    ~1 in 10 id8s collide): prefer the user's own threads over Codex side
+    threads, then this project's sessions, before calling it ambiguous."""
+    for keep in (lambda path, provider: provider != "codex"
+                 or not _codex_side_thread(_codex_meta(path)),
+                 _in_this_project):
+        if len(hits) > 1:
+            hits = [hit for hit in hits if keep(*hit)] or hits
+    return hits
+
+
+def resolve_reference(reference: str) -> list[tuple[Path, str]]:
+    """Sessions an id names: the exact id, else the session(s) a short id
+    (8+ characters) starts, narrowed by _narrow_prefix_hits."""
+    sid, hits = session_hits(reference)
+    if not hits and _ID_PREFIX_RE.fullmatch(sid):
+        hits = _narrow_prefix_hits(_prefix_hits(sid))
+    return hits
+
+
 def find_session_file(session: str) -> tuple[Path, str]:
     """Locate a session by id and infer its provider from the matching store.
 
     No exact match: an id prefix of 8+ characters (the short id a recap
-    shows) names the one session it starts, and lists them if it starts several.
+    shows) names the one session it starts, and lists them if it starts
+    several that _narrow_prefix_hits can't tell apart.
     """
     sid, unique = session_hits(session)
     prefix = not unique and bool(_ID_PREFIX_RE.fullmatch(sid))
     if prefix:
-        unique = _prefix_hits(sid)
+        unique = resolve_reference(sid)
     if not unique:
         roots = f"{CLAUDE_PROJECTS_DIR} or {CODEX_HOME / 'sessions'}"
         hint = (" (a short id needs at least 8 characters)"
@@ -295,7 +324,7 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72,
                 continue
             if provider == "claude" and r.get("type") == "user" \
                     and not r.get("isSidechain") and not r.get("isMeta") \
-                    and isinstance(r.get("message"), dict):
+                    and not _harness_origin(r) and isinstance(r.get("message"), dict):
                 cmd = _command_name(r["message"])
                 if cmd:
                     if not skip_commands:
@@ -449,6 +478,28 @@ def load_records(path: Path) -> list[dict]:
     return out
 
 
+# Claude Code files some of its own text inside user turns: background-task
+# notices, reminders, hook output. Each is cut only in the shape it's written
+# in (a whole block, opening a line, closed), so the same tags typed or pasted
+# by the user stay.
+_CLAUDE_INJECTED_TAGS = ("task-notification", "system-reminder",
+                         "user-prompt-submit-hook", "local-command-caveat")
+_CLAUDE_INJECTED_RE = re.compile(
+    rf"^[ \t]*<({'|'.join(map(re.escape, _CLAUDE_INJECTED_TAGS))})(?:\s[^>\n]*)?>"
+    r".*?</\1>[ \t]*(?=\n|\Z)", re.DOTALL | re.MULTILINE)
+# The user's own `!command`, with its output (dropped, like any tool output).
+_CLAUDE_BASH_RE = re.compile(
+    r"^[ \t]*<bash-input>(.*?)</bash-input>"
+    r"(?:\s*<(bash-stdout|bash-stderr)>.*?</\2>)*", re.DOTALL | re.MULTILINE)
+
+
+def _harness_origin(record: dict) -> bool:
+    """A user record Claude Code delivered itself (a task notice, a message from
+    another session), not one the user typed."""
+    origin = record.get("origin")
+    return isinstance(origin, dict) and origin.get("kind") not in (None, "human")
+
+
 def user_text(msg: dict) -> str | None:
     """Real user prompt text, or None if this is a tool-result carrier / plumbing."""
     content = msg.get("content")
@@ -462,11 +513,31 @@ def user_text(msg: dict) -> str | None:
         text = "\n".join(parts)
     else:
         return None
-    text = text.strip()
+    text = _CLAUDE_INJECTED_RE.sub("", text)
+    text = _CLAUDE_BASH_RE.sub(lambda m: "!" + m.group(1).strip(), text).strip()
     if not text or text.startswith(_SKIP_PREFIXES) or text.startswith(_CAVEAT) \
             or text in _INTERRUPT_MARKERS:
         return None
     return text
+
+
+def queued_prompt(record: dict) -> str | None:
+    """What the user typed while Claude was working: Claude Code files it as a
+    `queued_command` attachment, often with no user record of its own."""
+    attachment = record.get("attachment")
+    if record.get("type") != "attachment" or record.get("isSidechain") \
+            or not isinstance(attachment, dict) \
+            or attachment.get("type") != "queued_command" \
+            or attachment.get("commandMode") != "prompt":
+        return None
+    origin = attachment.get("origin")
+    if not isinstance(origin, dict) or origin.get("kind") != "human":
+        return None  # a task notice, or a message from another session
+    return user_text({"content": attachment.get("prompt")})
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
 
 
 def _short(s: str, n: int = 48) -> str:
@@ -1111,8 +1182,17 @@ def _codex_answers(output) -> str | None:
 def normalized_events(records: list[dict], provider: str):
     """Yield (user|assistant|plan|tool, text) events from either provider."""
     if provider == "claude":
+        # A queued prompt that also became a user record is shown once.
+        typed = {_flat(text) for r in records
+                 if r.get("type") == "user" and isinstance(r.get("message"), dict)
+                 and not (r.get("isSidechain") or r.get("isMeta"))
+                 for text in [user_text(r["message"])] if text}
         for r in records:
-            if r.get("isSidechain") or r.get("isMeta"):
+            if r.get("isSidechain") or r.get("isMeta") or _harness_origin(r):
+                continue
+            queued = queued_prompt(r)
+            if queued and _flat(queued) not in typed:
+                yield "user", queued
                 continue
             typ, msg = r.get("type"), r.get("message")
             if not isinstance(msg, dict):
@@ -1239,6 +1319,10 @@ _LINEAGE_PATTERNS = (
     # And the read of what it produced.
     re.compile(r"session-transcript/([0-9a-fA-F-]{36})/"),
 )
+_ARGUMENT_PATTERNS = (_LINEAGE_PATTERNS[0], _LINEAGE_PATTERNS[2])
+# A full id, or the 8+ character start of one (`session-transcript 665adf03`).
+_SHORT_ID_RE = re.compile(r"(?<![\w./-])[0-9a-f]{8}(?:-[0-9a-f-]{1,27})?(?![\w./-])",
+                          re.I)
 # Invocations that aren't a resume name no parent: one that writes the
 # transcript somewhere chosen to keep it (/export-lite runs --save, --out or
 # --to) archives a session rather than continuing it, and a --recent recap
@@ -1249,9 +1333,10 @@ _EXPORT_FLAG_RE = re.compile(r"(?<!\S)--(?:save|out|to|recent)(?=[\s=]|$)")
 _QUOTES_RE = re.compile(r"[\"'\\]")
 # A shell line continuation keeps one command going onto the next line.
 _CONTINUATION_RE = re.compile(r"\\\r?\n")
-# Prose fields that only describe a tool call (Claude's Bash `description`,
-# Codex's `justification`): they can name a session without running anything.
-_PROSE_KEYS = frozenset({"description", "justification"})
+# Prose fields of a tool call (Claude's Bash `description`, Codex's
+# `justification`, a message or task prompt to another agent): they can name a
+# session, or quote a command, without running anything.
+_PROSE_KEYS = frozenset({"description", "justification", "message", "prompt"})
 
 
 def _string_values(value):
@@ -1281,9 +1366,12 @@ def _lineage_strings(record: dict, provider: str):
     they just read.
     """
     if provider == "claude":
+        queued = queued_prompt(record)
+        if queued:
+            yield queued
         message = record.get("message")
-        if not isinstance(message, dict):
-            return
+        if not isinstance(message, dict) or _harness_origin(record):
+            return  # a task notice can quote a subagent's own commands
         content = message.get("content")
         if record.get("type") == "user":
             if isinstance(content, str):
@@ -1340,9 +1428,14 @@ def lineage_ids(session: Session) -> list[str]:
                 for match in pattern.finditer(text):
                     if _EXPORT_FLAG_RE.search(_QUOTES_RE.sub(" ", match.group(1))):
                         continue
-                    for sid in _SESSION_ID_RE.findall(match.group(1)):
+                    # An argument list can name a session by its short id
+                    # too; free typed text only by a full one (an 8-hex
+                    # commit hash there is no session).
+                    ids = (_SHORT_ID_RE if pattern in _ARGUMENT_PATTERNS
+                           else _SESSION_ID_RE).findall(match.group(1))
+                    for sid in ids:
                         sid = sid.lower()
-                        if sid != session.id.lower() and sid not in found:
+                        if not session.id.lower().startswith(sid) and sid not in found:
                             found.append(sid)
     return found
 
@@ -1362,7 +1455,7 @@ def follow_lineage(seeds: list[Session]) -> tuple[list[Session], dict[str, list[
     while queue:
         session = queue.pop(0)
         for sid in lineage_ids(session):
-            _, hits = session_hits(sid)
+            hits = resolve_reference(sid)  # a short id, by the same rules
             if len(hits) != 1:
                 reason = "ambiguous" if hits else "not found"
                 print(f"--deep: {session.id[:8]} references {sid[:8]} "
@@ -1830,9 +1923,16 @@ def only_ran_this_family(session: Session) -> bool:
                 invoked = True
         return invoked
     for record in session.records:
+        queued = queued_prompt(record)  # typed mid-turn: input like any other
+        if queued:
+            if not _family_invocation(queued):
+                return False
+            invoked = True
+            continue
         message = record.get("message")
         if record.get("type") != "user" or record.get("isSidechain") \
-                or record.get("isMeta") or not isinstance(message, dict):
+                or record.get("isMeta") or _harness_origin(record) \
+                or not isinstance(message, dict):
             continue
         command = _command_name(message)
         if command:  # Claude files a slash command's arguments separately
