@@ -266,14 +266,21 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72,
                 if txt:
                     return _short(txt, limit)
             payload = r.get("payload")
-            if provider == "codex" and r.get("type") == "event_msg" \
-                    and isinstance(payload, dict) and payload.get("type") == "user_message":
+            if provider != "codex" or not isinstance(payload, dict):
+                continue
+            txt = None
+            if r.get("type") == "event_msg" and payload.get("type") == "user_message":
                 txt = payload.get("message")
-                if isinstance(txt, str) and txt.strip():
-                    if skip_commands and _INVOCATION_ONLY_RE.match(txt.strip()):
-                        fallback = fallback or _short(txt, limit)
-                        continue
-                    return _short(txt, limit)
+            elif r.get("type") == "response_item" and payload.get("type") == "message" \
+                    and payload.get("role") == "user":
+                txt = _codex_typed_text(payload)  # rollouts without user_message
+            if isinstance(txt, str) and txt.strip():
+                txt = _plain_mentions(txt.strip())
+                if skip_commands and (_INVOCATION_ONLY_RE.match(txt)
+                                      or _family_invocation(txt)):
+                    fallback = fallback or _short(txt, limit)
+                    continue
+                return _short(txt, limit)
     except OSError:
         pass
     return fallback
@@ -481,8 +488,8 @@ def tool_label(name: str, inp: dict | None) -> str:
 
 
 _CODEX_CONTROL_TOOLS = {
-    "create_goal", "get_goal", "request_user_input", "update_goal", "update_plan",
-    "wait", "write_stdin",
+    "create_goal", "get_goal", "request_user_input", "request_user_input_async",
+    "update_goal", "update_plan", "wait", "write_stdin",
 }
 _SHELL_SKIP = {
     "[", "]", "basename", "cut", "dirname", "do", "done", "echo", "else", "exit",
@@ -907,16 +914,133 @@ def _codex_plan_text(text: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _codex_message_text(payload: dict) -> str | None:
+def _codex_text_items(payload: dict) -> list[str] | None:
     content = payload.get("content")
     if not isinstance(content, list):
         return None
-    parts = [item.get("text", "") for item in content
-             if isinstance(item, dict)
-             and item.get("type") in ("input_text", "output_text", "text")
-             and isinstance(item.get("text"), str)]
-    text = "\n".join(parts).strip()
+    return [item["text"] for item in content
+            if isinstance(item, dict)
+            and item.get("type") in ("input_text", "output_text", "text")
+            and isinstance(item.get("text"), str)]
+
+
+def _codex_message_text(payload: dict) -> str | None:
+    parts = _codex_text_items(payload)
+    text = "\n".join(parts or []).strip()
     return text or None
+
+
+# Codex files a lot as user messages that nobody typed: the AGENTS.md it
+# loaded, environment and skill context, subagent notices, plugin hints. Newer
+# rollouts carry no `user_message` events to tell the typed turns apart, so
+# these are cut out of each content item, keeping whatever was typed beside them.
+_CODEX_AGENTS_MD_RE = re.compile(
+    r"\A\s*# AGENTS\.md instructions\b.*?(?:</INSTRUCTIONS>|\Z)", re.DOTALL)
+_CODEX_INJECTED_TAGS = (
+    "environment_context", "skill", "subagent_notification", "recommended_plugins",
+    "turn_aborted", "user_instructions", "realtime_delegation",
+    "guardian_tool_descriptions", "external_codex_apps_open_page",
+    "in-app-browser-context",
+)
+_TAG_NAMES = "|".join(map(re.escape, _CODEX_INJECTED_TAGS))
+_CODEX_INJECTED_RE = re.compile(rf"<({_TAG_NAMES})(?:\s[^>]*)?>.*?</\1>", re.DOTALL)
+# One cut short (no closing tag) only counts when it opens the item.
+_CODEX_UNCLOSED_RE = re.compile(rf"\A\s*<(?:{_TAG_NAMES})(?:\s[^>]*)?>")
+# IDE and attachment context wrapped around the request ("## My request:"),
+# or just that header left once an injected block before it is cut.
+_CODEX_REQUEST_RE = re.compile(
+    r"\A\s*(?:# (?:Context from my IDE setup|Files mentioned by the user|"
+    r"Files pasted by the user):.*?^)?## My request(?: for Codex)?:[ \t]*\n?",
+    re.DOTALL | re.MULTILINE)
+# The user's own `!command`: keep the command, drop its output.
+_CODEX_SHELL_RE = re.compile(
+    r"\A\s*<user_shell_command>\s*<command>\s*(.*?)\s*</command>", re.DOTALL)
+# An answer to a question the agent asked (request_user_input_async).
+_CODEX_REPLY_RE = re.compile(
+    r"\A\s*<send_user_message_question_reply>\s*(.*?)\s*"
+    r"</send_user_message_question_reply>\s*\Z", re.DOTALL)
+# Codex Desktop files a typed `$skill` (or `@plugin`) mention as a link to it.
+_SKILL_LINK_RE = re.compile(r"\[([/$@][\w.:-]+)\]\([^)\n]*\)")
+# An attached image: `<image name=[Image #1] path="…">`, then `</image>`.
+_CODEX_IMAGE_RE = re.compile(r"<image name=(\[[^\]\n]*\])[^>\n]*>|</image>")
+
+
+def _plain_mentions(text: str) -> str:
+    """`[$resume-lite](/…/SKILL.md)` back to the `$resume-lite` that was typed."""
+    return _SKILL_LINK_RE.sub(r"\1", text)
+
+
+def _question_answers(raw: str) -> str:
+    try:
+        replies = json.loads(raw)
+    except ValueError:
+        return raw
+    replies = replies if isinstance(replies, list) else [replies]
+    answers = [reply["answer"].strip() for reply in replies
+               if isinstance(reply, dict) and isinstance(reply.get("answer"), str)
+               and reply["answer"].strip()]
+    return "\n".join(answers) or raw
+
+
+def _codex_typed_item(text: str) -> str:
+    """The part of one Codex user content item that the user typed."""
+    match = _CODEX_AGENTS_MD_RE.match(text)
+    if match:
+        text = text[match.end():]
+    text = _CODEX_INJECTED_RE.sub("", text)
+    if _CODEX_UNCLOSED_RE.match(text):
+        return ""
+    match = _CODEX_REQUEST_RE.match(text)
+    if match:
+        text = text[match.end():]
+    match = _CODEX_REPLY_RE.match(text)
+    if match:
+        text = _question_answers(match.group(1))
+    match = _CODEX_SHELL_RE.match(text)
+    if match:
+        text = "!" + match.group(1)
+    text = _CODEX_IMAGE_RE.sub(lambda m: m.group(1) or "", text)
+    return _plain_mentions(text).strip()
+
+
+def _codex_typed_text(payload: dict) -> str | None:
+    """A Codex user message minus what the harness injected into it."""
+    parts = [_codex_typed_item(text) for text in _codex_text_items(payload) or []]
+    text = "\n".join(part for part in parts if part)
+    return text or None
+
+
+# Questions the agent puts to the user live only in these tool calls (no
+# assistant message repeats them); the synchronous one's output holds the answer.
+_CODEX_QUESTION_TOOLS = frozenset({"request_user_input", "request_user_input_async"})
+
+
+def _codex_questions(args: dict) -> str | None:
+    blocks = []
+    for question in args.get("questions") or []:
+        if not isinstance(question, dict):
+            continue
+        text = question.get("question") or question.get("title")
+        if not isinstance(text, str) or not text.strip():
+            continue
+        lines = [text.strip()]
+        for option in question.get("options") or []:
+            label = option.get("label") if isinstance(option, dict) else option
+            if isinstance(label, str) and label.strip():
+                lines.append(f"- {label.strip()}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) or None
+
+
+def _codex_answers(output) -> str | None:
+    data = _json_object(output)
+    answers = data.get("answers")
+    if not isinstance(answers, dict):
+        return None
+    picked = [answer.strip() for entry in answers.values() if isinstance(entry, dict)
+              for answer in entry.get("answers") or []
+              if isinstance(answer, str) and answer.strip()]
+    return "\n".join(picked) or None
 
 
 def normalized_events(records: list[dict], provider: str):
@@ -953,6 +1077,7 @@ def normalized_events(records: list[dict], provider: str):
                    and isinstance(r.get("payload"), dict)
                    and r["payload"].get("type") == "agent_message"
                    and isinstance(r["payload"].get("message"), str)}
+    asked: set = set()  # call ids of questions put to the user
     for r in records:
         payload = r.get("payload")
         if not isinstance(payload, dict):
@@ -967,13 +1092,27 @@ def normalized_events(records: list[dict], provider: str):
                 plan = _codex_plan_text(text)
                 yield ("plan", plan) if plan else ("assistant", text.strip())
         elif r.get("type") == "response_item":
-            if payload.get("type") == "message":
-                role, text = payload.get("role"), _codex_message_text(payload)
-                if role == "user" and "user_message" not in event_types and text:
-                    yield "user", text
-                elif role == "assistant" and text and text not in agent_texts:
-                    plan = _codex_plan_text(text)
-                    yield ("plan", plan) if plan else ("assistant", text)
+            kind = payload.get("type")
+            if kind == "message":
+                role = payload.get("role")
+                if role == "user" and "user_message" not in event_types:
+                    text = _codex_typed_text(payload)
+                    if text:
+                        yield "user", text
+                elif role == "assistant":
+                    text = _codex_message_text(payload)
+                    if text and text not in agent_texts:
+                        plan = _codex_plan_text(text)
+                        yield ("plan", plan) if plan else ("assistant", text)
+            elif kind == "function_call" and payload.get("name") in _CODEX_QUESTION_TOOLS:
+                question = _codex_questions(_json_object(payload.get("arguments")))
+                if question:
+                    asked.add(payload.get("call_id"))
+                    yield "assistant", question
+            elif kind == "function_call_output" and payload.get("call_id") in asked:
+                answer = _codex_answers(payload.get("output"))  # sync tool only
+                if answer:
+                    yield "user", answer
             for label in codex_tool_labels(payload):
                 yield "tool", label
 
@@ -1104,7 +1243,7 @@ def _lineage_strings(record: dict, provider: str):
     if payload.get("type") == "user_message" and isinstance(payload.get("message"), str):
         yield payload["message"]
     if payload.get("type") == "message" and payload.get("role") == "user":
-        text = _codex_message_text(payload)
+        text = _codex_typed_text(payload)  # not what the harness injected
         if text:
             yield text
     for key in ("input", "arguments", "command"):  # custom_tool_call / function_call
@@ -1131,7 +1270,7 @@ def lineage_ids(session: Session) -> list[str]:
     found: list[str] = []
     for record in session.records:
         for text in _lineage_strings(record, session.provider):
-            text = _CONTINUATION_RE.sub(" ", text)
+            text = _plain_mentions(_CONTINUATION_RE.sub(" ", text))
             for pattern in _LINEAGE_PATTERNS:
                 for match in pattern.finditer(text):
                     if _EXPORT_FLAG_RE.search(_QUOTES_RE.sub(" ", match.group(1))):
@@ -1580,7 +1719,7 @@ _COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
 def _family_invocation(text: str) -> bool:
     """Whether a prompt only runs resume/recap/export-lite, with nothing typed
     beyond its arguments (`/resume-lite <id> and fix the bug` is real work)."""
-    tokens = text.split()
+    tokens = _plain_mentions(text).split()  # Codex Desktop's [$name](path) too
     if not tokens or not _FAMILY_COMMAND_RE.match(tokens[0]):
         return False
     takes_value = False

@@ -543,6 +543,192 @@ class TrimTests(unittest.TestCase):
                                                tzinfo=datetime.timezone.utc).timestamp())
 
 
+# Real-shaped, anonymized Codex rollouts. Newer Codex writes no `user_message`
+# events: every user turn is a `response_item` user message, and the harness
+# files its own context the same way.
+GHOST = "99999999-1111-4111-8111-999999999999"  # named only by injected text
+AGENTS_MD = ("# AGENTS.md instructions for /work/app\n\n<INSTRUCTIONS>\n"
+             f"# Prompt prefixes\nRun session-transcript {GHOST} first.\n</INSTRUCTIONS>")
+ENV_CONTEXT = ("<environment_context>\n  <cwd>/work/app</cwd>\n  <shell>zsh</shell>\n"
+               "</environment_context>")
+SKILL_BLOCK = ("<skill>\n<name>resume-lite</name>\n<path>/home/u/.agents/skills/"
+               "resume-lite/SKILL.md</path>\n---\nname: resume-lite\n</skill>")
+PLUGINS = "<recommended_plugins>\nAvailable, not installed:\n- Dropbox\n</recommended_plugins>"
+BROWSER = ('<in-app-browser-context source="ambient-ui-state">\nThis block is '
+           "automatically supplied ambient UI state.\n# In app browser:\n- Current URL: "
+           "http://127.0.0.1:8774/\n</in-app-browser-context>")
+MENTION = "[$resume-lite](/home/u/.agents/skills/resume-lite/SKILL.md)"
+
+
+def stamped(record, minute=0):
+    return {"timestamp": f"2026-10-06T11:{minute:02d}:00Z", **record}
+
+
+def codex_user(*texts):
+    """A user `response_item`; None stands for an attached image."""
+    return {"type": "response_item", "payload": {"type": "message", "role": "user",
+            "content": [{"type": "input_image", "image_url": "data:image/png;base64,AA"}
+                        if text is None else {"type": "input_text", "text": text}
+                        for text in texts]}}
+
+
+def codex_reply(text, phase="final_answer"):
+    """An assistant message, mirrored first by an item_completed AgentMessage."""
+    return [{"type": "event_msg", "payload": {"type": "item_completed", "item": {
+                "type": "AgentMessage", "id": "m", "phase": phase,
+                "content": [{"type": "Text", "text": text}]}}},
+            {"type": "response_item", "payload": {"type": "message", "role": "assistant",
+                "phase": phase, "content": [{"type": "output_text", "text": text}]}}]
+
+
+def codex_mirror(text):
+    return {"type": "event_msg", "payload": {"type": "item_completed", "item": {
+        "type": "UserMessage", "id": "u", "content": [{"type": "text", "text": text}]}}}
+
+
+def codex_call(name, args, call_id, output):
+    return [{"type": "response_item", "payload": {"type": "function_call", "name": name,
+                "arguments": json.dumps(args), "call_id": call_id}},
+            {"type": "response_item", "payload": {"type": "function_call_output",
+                "call_id": call_id, "output": output}}]
+
+
+def codex_rollout(sid, cwd, version, *records):
+    desktop = version >= "0.160"
+    meta = {"type": "session_meta", "payload": {
+        "id": sid, "session_id": sid, "cwd": cwd, "cli_version": version,
+        "originator": "Codex Desktop" if desktop else "codex-tui",
+        "source": "vscode" if desktop else "cli", "thread_source": "user"}}
+    flat = [meta] + [r for item in records
+                     for r in (item if isinstance(item, list) else [item])]
+    return [stamped(record, i % 60) for i, record in enumerate(flat)]
+
+
+def old_tui_rollout(sid=IDS[6], cwd="/work/app"):
+    """codex-tui 0.153: context first, a typed `$resume-lite`, the skill body."""
+    typed = f"review last 3 commits\n\n$resume-lite {IDS[0]} to understand"
+    return codex_rollout(
+        sid, cwd, "0.153.4",
+        codex_user(AGENTS_MD, ENV_CONTEXT),
+        codex_user(typed), codex_mirror(typed),
+        codex_user(SKILL_BLOCK),
+        codex_reply("I'll read that session first.", "commentary"),
+        codex_call("exec_command", {"cmd": "git log -3"}, "c0", "abc123"),
+        codex_reply("Found four issues."),
+        codex_user("gcm!"), codex_mirror("gcm!"),
+        codex_reply("Committed."),
+    )
+
+
+def desktop_rollout(sid=IDS[7], cwd="/work/app"):
+    """Codex Desktop 0.160: plugin hints, browser state, questions, subagents."""
+    request = f"{BROWSER}\n\n## My request:\nmake the shrimp icon less realistic"
+    return codex_rollout(
+        sid, cwd, "0.160.0",
+        codex_user(PLUGINS, AGENTS_MD, ENV_CONTEXT),
+        codex_user('<external_codex_apps_open_page>{"page_id":null}'
+                   "</external_codex_apps_open_page>"),
+        codex_user(request), codex_mirror(request),
+        codex_reply("On it.", "commentary"),
+        {"type": "response_item", "payload": {  # inter-agent traffic, encrypted
+            "type": "agent_message", "author": "/root/designer", "recipient": "/root",
+            "content": [{"type": "input_text", "text": "Message Type: MESSAGE\n"},
+                        {"type": "encrypted_content", "encrypted_content": "gAAAA"}]}},
+        codex_user("<subagent_notification>\n{\"agent\": \"designer\", \"text\": "
+                   f"\"ran session-transcript {GHOST}\"}}\n</subagent_notification>"),
+        codex_call("request_user_input_async", {"questions": [
+            {"title": "Which style?", "options": ["Flat", "Ghibli"]}]}, "c1", "queued"),
+        codex_user('<send_user_message_question_reply>\n[{"questionItemId":"x",'
+                   '"question":"Which style?","answer":"Ghibli, softer"}]\n'
+                   "</send_user_message_question_reply>"),
+        codex_user("<turn_aborted>\nThe user interrupted the previous turn on purpose."
+                   "\n</turn_aborted>"),
+        codex_user("\n# Files mentioned by the user:\n\n## shot.png: /tmp/shot.png\n\n"
+                   "## My request:\ncompare with this",
+                   '<image name=[Image #1] path="/tmp/shot.png">', None, "</image>"),
+        codex_user("<user_shell_command>\n<command>\nnode --version\n</command>\n"
+                   "<result>\nExit code: 0\nOutput:\nv22\n</result>\n</user_shell_command>"),
+        codex_call("request_user_input", {"questions": [{"id": "q", "question": "Bundle deps?",
+            "options": [{"label": "Yes"}, {"label": "No (Recommended)"}]}]}, "c2",
+            json.dumps({"answers": {"q": {"answers": ["No (Recommended)"]}}})),
+        codex_user(f"{MENTION} {IDS[1]} --deep"),
+        codex_reply("Done, shrimp redrawn."),
+    )
+
+
+def turns(records):
+    return [(kind, text) for kind, text in TRANSCRIPT["normalized_events"](records, "codex")
+            if kind != "tool"]
+
+
+class CodexRolloutTests(unittest.TestCase):
+    def test_old_tui_rollout(self):
+        self.assertEqual(turns(old_tui_rollout()), [
+            ("user", f"review last 3 commits\n\n$resume-lite {IDS[0]} to understand"),
+            ("assistant", "I'll read that session first."),
+            ("assistant", "Found four issues."),
+            ("user", "gcm!"),
+            ("assistant", "Committed."),
+        ])
+
+    def test_desktop_rollout(self):
+        self.assertEqual(turns(desktop_rollout()), [
+            ("user", "make the shrimp icon less realistic"),
+            ("assistant", "On it."),
+            ("assistant", "Which style?\n- Flat\n- Ghibli"),
+            ("user", "Ghibli, softer"),
+            ("user", "compare with this\n[Image #1]"),
+            ("user", "!node --version"),
+            ("assistant", "Bundle deps?\n- Yes\n- No (Recommended)"),
+            ("user", "No (Recommended)"),
+            ("user", f"$resume-lite {IDS[1]} --deep"),
+            ("assistant", "Done, shrimp redrawn."),
+        ])
+        body = TRANSCRIPT["_transcript_body"](desktop_rollout(), True, "codex")[0]
+        for injected in ("AGENTS.md", "Dropbox", "<cwd>", "page_id", "In app browser",
+                         "designer", "Message Type", "interrupted", "Exit code", "v22",
+                         "SKILL.md", "/tmp/shot.png", "request_user_input"):
+            self.assertNotIn(injected, body)
+
+    def test_typed_part_of_a_mixed_item_is_kept(self):
+        typed = TRANSCRIPT["_codex_typed_item"]
+        self.assertEqual(typed(f"looks good\n\n{BROWSER}"), "looks good")
+        self.assertEqual(typed(f"{AGENTS_MD}\n\nand then this"), "and then this")
+        self.assertEqual(typed(f"{ENV_CONTEXT}{SKILL_BLOCK}"), "")
+        self.assertEqual(typed("<skill>\n<name>x</name>\ncut short"), "")
+        self.assertEqual(typed("# Context from my IDE setup:\n\n## Open tabs:\n- a.py\n\n"
+                               "## My request for Codex:\nfix a.py"), "fix a.py")
+        self.assertEqual(typed("what does a <skill> tag do?"), "what does a <skill> tag do?")
+
+    def test_lineage_reads_only_typed_turns(self):
+        # Genuine resumes, typed or as a Desktop mention; never ids that only
+        # appear in AGENTS.md or a subagent notice.
+        for records, expected in ((old_tui_rollout(), [IDS[0]]),
+                                  (desktop_rollout(), [IDS[1]])):
+            session = TRANSCRIPT["Session"](Path("x.jsonl"), "codex", records[0]["payload"]["id"],
+                                            records)
+            with self.subTest(version=records[0]["payload"]["cli_version"]):
+                self.assertEqual(TRANSCRIPT["lineage_ids"](session), expected)
+
+    def test_snippet_and_save_topic(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "rollout.jsonl"
+            first = codex_user(f"{MENTION} {IDS[1]} --deep")
+            records = codex_rollout(IDS[5], "/work/app", "0.160.0",
+                                    codex_user(AGENTS_MD, ENV_CONTEXT), first,
+                                    codex_user(SKILL_BLOCK), codex_reply("Read it."),
+                                    codex_user("now fix the parser"), codex_reply("Fixed."))
+            path.write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+            snippet = TRANSCRIPT["first_user_snippet"]
+            self.assertEqual(snippet(path, "codex"), f"$resume-lite {IDS[1]} --deep")
+            self.assertEqual(snippet(path, "codex", skip_commands=True), "now fix the parser")
+
+    def test_trimming_counts_typed_turns_only(self):
+        body = TRANSCRIPT["_transcript_body"](old_tui_rollout(), True, "codex", 1)[0]
+        self.assertTrue(body.startswith("## 👤 User\n\nreview last 3 commits"))
+        self.assertIn("## ✂️ 2 messages omitted", body)  # 4 messages, 1 + 1 kept
+
+
 class RecentTests(unittest.TestCase):
     """--recent selection, filters, output naming, and --messages end to end."""
 
@@ -774,6 +960,29 @@ class RecentTests(unittest.TestCase):
         self.assertEqual(sorted(self.picked(text)), sorted(kept))
         self.assertIn("passed over 4 sessions that only ran resume-lite, "
                       "recap-lite or export-lite", err)
+
+    def write_rollout(self, sid, day, *records):
+        rows = codex_rollout(sid, self.cwd, "0.160.0", *records)
+        for row in rows:
+            row["timestamp"] = f"2026-09-{day:02d}T12:00:00Z"
+        path = self.codex / "sessions" / "2026" / f"rollout-x-{sid}.jsonl"
+        path.write_text("\n".join(map(json.dumps, rows)) + "\n", encoding="utf-8")
+
+    def test_real_codex_sessions_that_only_ran_this_family(self):
+        # Injected AGENTS.md and skill bodies are not user input.
+        ids = [f"c0000000-1111-4111-8111-00000000000{i}" for i in (1, 2, 3)]
+        context = codex_user(AGENTS_MD, ENV_CONTEXT)
+        self.write_rollout(ids[0], 1, context, codex_user("$resume-lite"),
+                           codex_user(SKILL_BLOCK), codex_reply("Pick one."))
+        self.write_rollout(ids[1], 2, context, codex_user(f"{MENTION} {IDS[0]}"),
+                           codex_user(SKILL_BLOCK), codex_reply("Picked up."))
+        self.write_rollout(ids[2], 3, context, codex_user(f"{MENTION} {IDS[0]}"),
+                           codex_user(SKILL_BLOCK), codex_reply("Picked up."),
+                           codex_user("keep going"), codex_reply("Done."))
+        _, text, err = self.recap("--recent", 5)
+        self.assertEqual(self.picked(text), [ids[2]])
+        self.assertIn("passed over 2 sessions that only ran", err)
+        self.assertNotIn("AGENTS.md", text)
 
     def test_header_names_what_was_excluded(self):
         for day in range(1, 6):
