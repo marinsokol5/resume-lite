@@ -279,8 +279,9 @@ class OutputTests(unittest.TestCase):
         self.assertEqual(self.invoke(self.paths[0], self.paths[1], "--out", "fresh/"),
                          self.root / "fresh" / combined)
 
-    def write_session(self, sid, day, topic, reply="ok"):
-        """A Codex session started on 2026-09-<day> with `topic` (or no prompt)."""
+    def write_session(self, sid, day, topic, reply="ok", more=()):
+        """A Codex session started on 2026-09-<day> with `topic` (or no prompt),
+        then `more` (prompt, reply) pairs."""
         records = [{"type": "session_meta", "timestamp": f"2026-09-{day:02d}T12:00:00Z",
                     "payload": {"id": sid, "cwd": str(self.root)}}]
         if topic:
@@ -288,6 +289,9 @@ class OutputTests(unittest.TestCase):
                 "type": "user_message", "message": topic}})
         records.append({"type": "event_msg", "payload": {
             "type": "agent_message", "message": reply}})
+        for prompt, answer in more:
+            records += [{"type": "event_msg", "payload": {"type": "user_message", "message": prompt}},
+                        {"type": "event_msg", "payload": {"type": "agent_message", "message": answer}}]
         path = self.root / f"{sid}.jsonl"
         path.write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
         return path
@@ -299,12 +303,13 @@ class OutputTests(unittest.TestCase):
         base = self.root / "transcripts" / "2026-09-05-fix-the-parser.md"
         self.assertEqual(names, [base, base.with_name(base.stem + "-2.md"),
                                  base.with_name(base.stem + "-3.md")])
-        # Re-exporting a session refreshes its own file, wherever it landed.
-        self.write_session(ids[1], 5, "Fix the parser", reply="now with more")
+        # Re-exporting a session that moved on refreshes its own file.
+        self.write_session(ids[1], 5, "Fix the parser", more=[("and?", "now with more")])
         self.assertEqual(self.invoke(paths[1], "--save"), names[1])
         self.assertIn("now with more", names[1].read_text(encoding="utf-8"))
         for name, sid in zip(names, ids):
-            self.assertEqual(TRANSCRIPT["_file_signature"](name), ("single", (sid,), None))
+            self.assertEqual(TRANSCRIPT["_file_signature"](name),
+                             ("single", (sid,), None, "tools"))
         # --to DIR/ follows the same rule; an exact --to FILE stays exact.
         kept = [self.invoke(path, "--to", "kept/") for path in paths[:2]]
         self.assertEqual([p.name for p in kept], [base.name, base.stem + "-2.md"])
@@ -323,10 +328,13 @@ class OutputTests(unittest.TestCase):
                 self.assertEqual(self.invoke(path, "--save"),
                                  target.with_name("2026-09-06-notes-2.md"))
                 self.assertEqual(target.read_text(encoding="utf-8"), content)
-        exact = self.root / "mine.md"
+        # Not even an exact --to FILE replaces it; an earlier export there, it does.
+        exact = self.root / "README.md"
         exact.write_text("my own notes\n", encoding="utf-8")
-        self.assertEqual(self.invoke(path, "--to", "mine.md"), exact)  # as asked
-        self.assertNotEqual(exact.read_text(encoding="utf-8"), "my own notes\n")
+        self.assert_rejected(path, "--to", "README.md", message="isn't a session transcript")
+        self.assertEqual(exact.read_text(encoding="utf-8"), "my own notes\n")
+        kept = self.invoke(path, "--to", "kept.md")
+        self.assertEqual(self.invoke(self.paths[0], "--to", "kept.md"), kept)
 
     def test_topic_names_the_file(self):
         ids = [f"d{i:07x}-2222-4222-8222-{i:012x}" for i in range(1, 3)]
@@ -349,6 +357,55 @@ class OutputTests(unittest.TestCase):
                          self.root / "exact.md")
         self.assert_rejected(paths[0], "--topic", "x", message="--topic names a kept")
 
+    def test_reexport_never_drops_what_the_file_holds(self):
+        sid = "e1000001-2222-4222-8222-000000000001"
+        path = self.write_session(sid, 9, "Ship it")
+        first = self.invoke(path, "--save")
+        # Notes the user added to an export survive: the new one takes -2.
+        with first.open("a", encoding="utf-8") as stream:
+            stream.write("\n## My notes\n\nremember the flag\n")
+        self.assertEqual(self.invoke(path, "--save"), first.with_name(first.stem + "-2.md"))
+        self.assertIn("remember the flag", first.read_text(encoding="utf-8"))
+        # A --no-tools copy doesn't replace the full one either (nor vice versa).
+        bare = self.invoke(path, "--save", "--no-tools")
+        self.assertEqual(bare, first.with_name(first.stem + "-3.md"))
+        self.assertEqual(TRANSCRIPT["_file_signature"](bare)[-1], "no-tools")
+
+    def test_a_running_turn_still_refreshes_its_export(self):
+        # Exported mid-turn (this session, typically): later the same turn ran
+        # more tools, so its last tools line grew. That's still the same export.
+        sid = "e2000001-2222-4222-8222-000000000001"
+        meta = {"type": "session_meta", "timestamp": "2026-09-10T12:00:00Z",
+                "payload": {"id": sid, "cwd": str(self.root)}}
+        ask = {"type": "event_msg", "payload": {"type": "user_message", "message": "Look"}}
+        def call(cmd):
+            return {"type": "response_item", "payload": {
+                "type": "function_call", "name": "exec_command",
+                "arguments": json.dumps({"cmd": cmd})}}
+        done = {"type": "event_msg", "payload": {"type": "agent_message", "message": "Done."}}
+        path = self.root / f"{sid}.jsonl"
+        path.write_text("\n".join(map(json.dumps, [meta, ask, call("cat a.py")])),
+                        encoding="utf-8")
+        first = self.invoke(path, "--save")
+        self.assertIn("Read(a.py)_", first.read_text(encoding="utf-8"))
+        path.write_text("\n".join(map(json.dumps, [meta, ask, call("cat a.py"),
+                                                   call("cat b.py"), done])),
+                        encoding="utf-8")
+        self.assertEqual(self.invoke(path, "--save"), first)
+        self.assertIn("Read(a.py), Read(b.py)_", first.read_text(encoding="utf-8"))
+
+    def test_topics_in_any_language(self):
+        slug = TRANSCRIPT["_slugify"]
+        self.assertEqual(slug("Ažuriranje čišćenje Đuro"), "azuriranje-ciscenje-duro")
+        self.assertEqual(slug("Straße Æble Øre łódź Þing"), "strasse-aeble-ore-lodz-thing")
+        path = self.write_session("e3000001-2222-4222-8222-000000000001", 11, "Opening words")
+        result = self.run_script(path, "--save", "--topic", "重构")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.strip().endswith("2026-09-11-opening-words.md"))
+        self.assertIn("no letters or digits a file name can keep", result.stderr)
+        result = self.run_script(path, "--to", "exact.md", "--topic", "x")
+        self.assertIn("--topic 'x' ignored", result.stderr)
+
     def test_no_topic_names_follow_the_same_rule(self):
         ids = ["c0000001-2222-4222-8222-000000000001", "c0000002-2222-4222-8222-000000000002"]
         names = [self.invoke(self.write_session(sid, 7, None), "--save") for sid in ids]
@@ -365,9 +422,13 @@ class OutputTests(unittest.TestCase):
         recap = TRANSCRIPT["build_combined"](
             two, True, None, "> x\n> Trimmed with --messages 3: …", 3,
             "2 most recent Codex sessions")
-        self.assertEqual(signature(single.splitlines()), ("single", (IDS[0],), None))
-        self.assertEqual(signature(combined.splitlines()), ("combined", tuple(IDS[:2]), None))
-        self.assertEqual(signature(recap.splitlines()), ("recap", tuple(IDS[:2]), 3))
+        bare = TRANSCRIPT["build_transcript"](one.records, one.id, False, "codex",
+                                              TRANSCRIPT["EXPORT_BLURB_NO_TOOLS"])
+        self.assertEqual(signature(single.splitlines()), ("single", (IDS[0],), None, "tools"))
+        self.assertEqual(signature(bare.splitlines()), ("single", (IDS[0],), None, "no-tools"))
+        self.assertEqual(signature(combined.splitlines()),
+                         ("combined", tuple(IDS[:2]), None, "tools"))
+        self.assertEqual(signature(recap.splitlines()), ("recap", tuple(IDS[:2]), 3, "tools"))
         for text in ("", "# Notes\n---\n", "# Session transcript — 2 sessions combined\n---\n",
                      "# Session transcript — something else\n1. `x` — y\n---\n"):
             with self.subTest(text=text):
@@ -1251,7 +1312,7 @@ class RecentTests(unittest.TestCase):
                 self.assertEqual(out.parent.name, sid)  # named by the full id
                 self.assertIn(f"# Session transcript — `{sid}`", text)
         out, _, _ = self.recap(IDS[1][:8], "--save")
-        self.assertEqual(TRANSCRIPT["_file_signature"](out), ("single", (IDS[1],), None))
+        self.assertEqual(TRANSCRIPT["_file_signature"](out), ("single", (IDS[1],), None, "tools"))
         twins = ["abcdef12-1111-4111-8111-000000000001", "abcdef12-2222-4111-8111-000000000002"]
         for day, sid in enumerate(twins, 3):
             self.add(sid, "codex", day)
@@ -1409,9 +1470,9 @@ class RecentTests(unittest.TestCase):
         trimmed, _, _ = self.recap("--recent", 2, "--save", "--messages", 1)
         self.assertEqual(trimmed, export.with_name(export.stem + "-4.md"))
         signature = TRANSCRIPT["_file_signature"]
-        self.assertEqual(signature(export), ("combined", (IDS[1], IDS[0]), None))
-        self.assertEqual(signature(recap), ("recap", (IDS[1], IDS[0]), None))
-        self.assertEqual(signature(trimmed), ("recap", (IDS[1], IDS[0]), 1))
+        self.assertEqual(signature(export), ("combined", (IDS[1], IDS[0]), None, "tools"))
+        self.assertEqual(signature(recap), ("recap", (IDS[1], IDS[0]), None, "tools"))
+        self.assertEqual(signature(trimmed), ("recap", (IDS[1], IDS[0]), 1, "tools"))
 
     def test_messages_needs_ids_or_recent(self):
         self.add(IDS[0], "claude", 1)

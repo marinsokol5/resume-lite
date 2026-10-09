@@ -83,6 +83,7 @@ import re
 import shlex
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import NamedTuple
 
@@ -1519,7 +1520,13 @@ def _compact_tool_labels(labels: list[str]) -> list[str]:
 EXPORT_BLURB = ("> Light transcript (human ↔ assistant text and plan-mode plans; each "
                 "tool call noted with its target when available — tool *outputs* and "
                 "thinking omitted).")
-BLURB = EXPORT_BLURB + " Read it to recover where we left off, then continue the work."
+# --no-tools says so, which also tells a kept file's mode apart (see
+# transcript_signature).
+NO_TOOLS_MARK = "plan-mode plans only — tool calls"
+EXPORT_BLURB_NO_TOOLS = (f"> Light transcript (human ↔ assistant text and {NO_TOOLS_MARK}, "
+                         "their outputs and thinking omitted).")
+RESUME_LINE = " Read it to recover where we left off, then continue the work."
+BLURB = EXPORT_BLURB + RESUME_LINE
 
 
 def _source_name(provider: str) -> str:
@@ -1724,8 +1731,19 @@ def combined_out_path(session_ids: list[str], kind: str = "combined",
             / f"{kind}{suffix}.md")
 
 
+# Letters NFKD doesn't take apart into a base letter plus accents.
+_TRANSLITERATE = str.maketrans({
+    "đ": "d", "Đ": "d", "ð": "d", "Ð": "d", "ø": "o", "Ø": "o", "ł": "l", "Ł": "l",
+    "ß": "ss", "æ": "ae", "Æ": "ae", "œ": "oe", "Œ": "oe", "þ": "th", "Þ": "th",
+    "ı": "i", "ħ": "h", "Ħ": "h",
+})
+
+
 def _slugify(text: str, limit: int = 48) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    """Lowercase ASCII words joined by hyphens: `Čišćenje Đura` -> `ciscenje-dura`."""
+    plain = unicodedata.normalize("NFKD", text.translate(_TRANSLITERATE))
+    plain = "".join(ch for ch in plain if not unicodedata.combining(ch))
+    slug = re.sub(r"[^a-z0-9]+", "-", plain.lower()).strip("-")
     if len(slug) <= limit:
         return slug
     return slug[:limit].rsplit("-", 1)[0] or slug[:limit]  # don't end mid-word
@@ -1753,6 +1771,9 @@ def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR,
     date = (_local_date(stamps[0]) if stamps else
             datetime.date.fromtimestamp(session.path.stat().st_mtime).isoformat())
     slug = _slugify(topic or "")
+    if topic and not slug:
+        print(f"--topic {topic!r}: no letters or digits a file name can keep; "
+              "naming it after the opening prompt instead", file=sys.stderr)
     if not slug:
         opening = first_user_snippet(session.path, session.provider, limit=120,
                                      skip_commands=True)
@@ -1766,7 +1787,7 @@ _TITLE = "# Session transcript — "
 def transcript_signature(lines) -> tuple | None:
     """What a transcript of ours holds, read from its header (the lines up to
     the first `---`): (single|combined|recap, its session ids in order, the
-    --messages count or None). None for any other file."""
+    --messages count or None, tools|no-tools). None for any other file."""
     header = []
     for line in lines:
         if line.rstrip("\n") == "---":
@@ -1783,17 +1804,44 @@ def transcript_signature(lines) -> tuple | None:
     text = "\n".join(header)
     trim = re.search(r"^> Trimmed with --messages (\d+):", text, re.MULTILINE)
     messages = int(trim.group(1)) if trim else None
+    tools = "no-tools" if NO_TOOLS_MARK in text else "tools"
     single = re.fullmatch(r"`([^`\s]+)`", title)
     if single:
-        return "single", (single.group(1),), messages
+        return "single", (single.group(1),), messages, tools
     ids = tuple(re.findall(r"^\d+\. `([^`\s]+)` — ", text, re.MULTILINE))
     if not ids:
         return None
     if re.fullmatch(r"\d+ most recent (?:Claude Code |Codex )?sessions?", title):
-        return "recap", ids, messages
+        return "recap", ids, messages, tools
     if re.fullmatch(r"\d+ sessions combined", title):
-        return "combined", ids, messages
+        return "combined", ids, messages, tools
     return None
+
+
+def _body(lines: list[str]) -> list[str]:
+    """A transcript's lines below its header, minus the meta lines (turn
+    counts, time spans) that change as a session grows."""
+    end = lines.index("---") if "---" in lines else len(lines)
+    body = [line for line in lines[end + 1:] if not line.startswith("_Source: ")]
+    while body and not body[-1].strip():
+        body.pop()
+    return body
+
+
+def replaceable(path: Path, transcript: str) -> bool:
+    """Whether writing `transcript` over `path` loses nothing: the file is an
+    earlier export of the same thing, and the new one only adds to it. Notes
+    the user wrote into it, or another session, make it not."""
+    new = transcript.splitlines()
+    if not path.is_file() or _file_signature(path) != transcript_signature(new):
+        return False
+    try:
+        old = _body(path.read_text(encoding="utf-8").splitlines())
+    except (OSError, UnicodeDecodeError):
+        return False
+    if old and old[-1].startswith("_🔧 tools: "):
+        old.pop()  # a turn still running when it was exported gains more tools
+    return _body(new)[:len(old)] == old
 
 
 def _file_signature(path: Path) -> tuple | None:
@@ -1807,14 +1855,14 @@ def claim_name(path: Path, transcript: str) -> Path:
     """An auto-generated name (date + topic) to write `transcript` to.
 
     Exporting the same thing again (same session ids, same kind of transcript,
-    same --messages) overwrites the earlier file; anything else already there,
-    including a file that isn't one of our transcripts, is left alone and the
-    name takes the first free `-2`, `-3`, ….
+    same --messages and tools mode) overwrites the earlier file, as long as it
+    holds nothing the new one doesn't (see replaceable); anything else already
+    there, including a file that isn't one of our transcripts, is left alone
+    and the name takes the first free `-2`, `-3`, ….
     """
-    mine = transcript_signature(transcript.splitlines())
     candidate, number = path, 1
     while candidate.exists():
-        if candidate.is_file() and _file_signature(candidate) == mine:
+        if replaceable(candidate, transcript):
             return candidate
         number += 1
         candidate = path.with_name(f"{path.stem}-{number}{path.suffix}")
@@ -1836,6 +1884,14 @@ def out_path(target: str, sessions: list[Session], topic: str | None = None,
     if target.endswith(separators) or path.is_dir():
         named = save_out_path(sessions, path, topic)
         return claim_name(named, transcript) if transcript is not None else named
+    if topic is not None:
+        print(f"--topic {topic!r} ignored: {target} is an exact file name",
+              file=sys.stderr)
+    if path.exists() and transcript is not None and (
+            not path.is_file() or _file_signature(path) is None):
+        sys.exit(f"{target} already exists and isn't a session transcript: not "
+                 "replacing it (give another file name, or a directory/ to get "
+                 "<date>-<topic>.md inside it)")
     return path
 
 
@@ -2264,7 +2320,8 @@ def main() -> None:
     # (Kept ones don't need it: their header tells claim_name they differ.)
     suffix = f"-m{args.messages}" if args.messages else ""
     # A recap is read to be summarized, not continued: keep its header neutral.
-    blurb = EXPORT_BLURB if keep or recent else BLURB
+    base = EXPORT_BLURB if args.tools else EXPORT_BLURB_NO_TOOLS
+    blurb = base if keep or recent else base + RESUME_LINE
     if recent:
         title = (f"{len(sessions)} most recent {which}session"
                  + ("" if len(sessions) == 1 else "s"))

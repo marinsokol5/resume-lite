@@ -102,19 +102,27 @@ reads the transcript back, so exporting costs the conversation next to nothing.
 ```
 
 - **Arguments sort themselves:** session ids (full, or their first 8+
-  characters) and `this` pick sessions; anything with a `/` or ending in `.md`
-  is the path; every other word is the topic.
+  characters) and `this` pick sessions; a destination — a word ending in `/`
+  or `.md`, or starting with `./`, `../`, `~/` or `/` — is the path; every
+  other word is the topic. So `/export-lite fix README.md typos` names the
+  file after the words: an existing file that isn't a transcript is never
+  overwritten, even when given as the path.
 - **Naming.** The date the first session started, then the topic: your words
   (they always win), else a short one the agent picks for the session you're
   in, else another session's opening prompt. With `--deep` the date is the
   oldest session's in the chain.
 - **Re-exporting** the same session(s) overwrites that same file — handy to
   refresh an export once the session has moved on. Anything else already under
-  that name (a different session, another combination, a recap, a trimmed
-  copy, a file of your own) is left alone, and the new export takes `-2`, `-3`, …
-- **A path** ending in `.md` is used exactly as given (no date). A directory —
-  one that exists, or any path ending in `/` (created) — gets
-  `<date>-<topic>.md` inside it, by the same rules.
+  that name (a different session, another combination, a recap, a trimmed or
+  `--no-tools` copy, an export you've added notes to, a file of your own) is
+  left alone, and the new export takes `-2`, `-3`, …
+- **A path** ending in `.md` is used exactly as given (no date), replacing
+  only an earlier transcript there. A directory — one that exists, or any path
+  ending in `/` (created) — gets `<date>-<topic>.md` inside it, by the same
+  rules.
+- **Topics in any language** are spelled out in plain letters
+  (`čišćenje Đuro` → `ciscenje-duro`); one with nothing left (`重构`) falls back
+  to the opening prompt, with a warning.
 - **`this`** is the session you're in. Claude Code hands the skill its id; in
   Codex (or anywhere it isn't handed over) the parser reads it from
   `CODEX_THREAD_ID` or `CLAUDE_CODE_SESSION_ID`.

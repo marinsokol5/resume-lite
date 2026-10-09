@@ -26,7 +26,11 @@ since it scopes sessions to the working directory.
 1. **Sort the arguments.** Each one is:
    - a **session** — a session id, full or its first 8+ characters (the script
      resolves it), or `this`;
-   - a **path** — contains `/` or ends in `.md`;
+   - a **path** — only a destination the user plainly gives: a word ending in
+     `/` or `.md`, or starting with `./`, `../`, `~/` or `/`. A `.md` word that
+     names an existing file other than an earlier export (`fix README.md
+     typos`) is a topic word, never a path; so is a `/` inside a word
+     (`CI/CD pipeline`);
    - a **flag** — `--deep`, `--no-tools`;
    - otherwise a **topic word**: all of them, in order, make the topic.
 
@@ -48,10 +52,16 @@ since it scopes sessions to the working directory.
 
    It always writes **one** file (several sessions are stitched into a single
    transcript, in the order given) and prints its path as the **last stdout
-   line**. On a missing or ambiguous id it exits non-zero with the reason —
-   relay that and ask the user to confirm. If it says it can't tell which
-   session is `this`, run it with no arguments to list this project's
-   sessions, take the newest, and tell the user which id you picked.
+   line**. When it exits non-zero:
+   - **a word you took for a session isn't one** — an 8+ character hex or
+     digit word (a commit hash, `20261009`): run again with it as a topic word;
+   - **a missing or ambiguous id** otherwise — relay the reason and ask the
+     user to confirm;
+   - **it won't replace a file** that exists and isn't a transcript — never
+     work around that; ask for another path (or drop it and use `--save`);
+   - **it can't tell which session is `this`** — run it with no arguments to
+     list this project's sessions, take the newest, and tell the user which id
+     you picked.
 
 4. **Report the path and stop**, saying which topic you chose if the user
    didn't give one. Where it applies, tell them that exporting the same
