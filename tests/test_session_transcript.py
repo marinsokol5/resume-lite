@@ -1044,6 +1044,49 @@ class RecentTests(unittest.TestCase):
         self.assertIn("passed over 2 sessions that only ran", err)
         self.assertNotIn("AGENTS.md", text)
 
+    def test_ids_can_be_shortened(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        for sid in IDS[:2]:  # the id8 a recap shows, for either store
+            with self.subTest(sid=sid):
+                out, text, _ = self.recap(sid[:8])
+                self.assertEqual(out.parent.name, sid)  # named by the full id
+                self.assertIn(f"# Session transcript — `{sid}`", text)
+        out, _, _ = self.recap(IDS[1][:8], "--save")
+        self.assertTrue(out.name.endswith(f"-{IDS[1][:8]}.md"))
+        twins = ["abcdef12-1111-4111-8111-000000000001", "abcdef12-2222-4111-8111-000000000002"]
+        for day, sid in enumerate(twins, 3):
+            self.add(sid, "codex", day)
+        result = self.run_script("abcdef12")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("session id prefix 'abcdef12' is ambiguous", result.stderr)
+        for sid in twins:
+            self.assertIn(sid, result.stderr)
+        out, _, _ = self.recap("ABCDEF12-2")
+        self.assertEqual(out.parent.name, twins[1])
+        self.assert_rejected("abcdef1", message="needs at least 8 characters")
+
+    def test_deep_from_a_short_id_follows_full_ids(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[2], "claude", 2,
+                 extra=[{"type": "user", "message": {"content": f"/resume-lite {IDS[0]}"},
+                         "timestamp": "2026-09-02T13:00:00Z"}])
+        out, text, err = self.recap(IDS[2][:8], "--deep")
+        self.assertEqual(self.picked(text), [IDS[0], IDS[2]])
+        self.assertIn(f"--deep: {IDS[2][:8]} resumed from {IDS[0][:8]}", err)
+
+    def test_recaps_show_local_last_active_time(self):
+        self.add(IDS[0], "claude", 1)
+        self.add(IDS[1], "codex", 2)
+        local = TRANSCRIPT["_local_time"]
+        _, text, _ = self.recap("--recent", 2)
+        for sid, day in ((IDS[1], 2), (IDS[0], 1)):
+            last = datetime.datetime(2026, 9, day, 12, 1, tzinfo=datetime.timezone.utc)
+            note = f" · last active {local(last.timestamp())}"
+            self.assertEqual(text.count(note), 2, sid)  # index line and its meta line
+        _, resumed, _ = self.recap(IDS[1], IDS[0])  # resume/export output unchanged
+        self.assertNotIn("last active", resumed)
+
     def test_codex_side_threads_are_not_listed(self):
         kinds = {
             "d0000000-1111-4111-8111-000000000001": {},  # the user's own thread
@@ -1181,7 +1224,7 @@ class PackagingTests(unittest.TestCase):
         skills = sorted(p.parent for p in (REPO / "skills").glob("*/SKILL.md"))
         for name in ("resume-lite", "export-lite", "recap-lite"):
             self.assertIn(REPO / "skills" / name, skills)
-        fix ="edit only the resume-lite copy, then run scripts/sync-skill-scripts"
+        fix = "edit only the resume-lite copy, then run scripts/sync-skill-scripts"
         for skill in skills:
             script = skill / "scripts" / "session-transcript"
             with self.subTest(skill=skill.name):

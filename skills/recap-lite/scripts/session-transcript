@@ -200,15 +200,55 @@ def session_hits(session: str) -> tuple[str, list[tuple[Path, str]]]:
     return sid, unique
 
 
+_ID_TAIL_RE = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\Z", re.I)
+# A short id as recaps and --deep print it (id8), or any longer piece of one.
+_ID_PREFIX_RE = re.compile(r"[0-9a-f][0-9a-f-]{7,35}", re.I)
+
+
+def _stored_id(path: Path) -> str:
+    """The session id a store's file name carries (Codex: after the timestamp)."""
+    match = _ID_TAIL_RE.search(path.stem)
+    return match.group(0).lower() if match else path.stem
+
+
+def _prefix_hits(prefix: str) -> list[tuple[Path, str]]:
+    """Every stored session whose id starts with `prefix`, any project."""
+    prefix = prefix.lower()
+    hits: list[tuple[Path, str]] = []
+    if CLAUDE_PROJECTS_DIR.is_dir():
+        hits += [(path, "claude") for path in CLAUDE_PROJECTS_DIR.rglob("*.jsonl")
+                 if path.stem.lower().startswith(prefix)]
+    hits += [(path, "codex") for path in _codex_session_files()
+             if _stored_id(path).startswith(prefix)]
+    unique, seen = [], set()
+    for path, provider in hits:
+        if str(path.resolve()) not in seen:
+            seen.add(str(path.resolve()))
+            unique.append((path, provider))
+    return unique
+
+
 def find_session_file(session: str) -> tuple[Path, str]:
-    """Locate a session by id and infer its provider from the matching store."""
+    """Locate a session by id and infer its provider from the matching store.
+
+    No exact match: an id prefix of 8+ characters (the short id a recap
+    shows) names the one session it starts, and lists them if it starts several.
+    """
     sid, unique = session_hits(session)
+    prefix = not unique and bool(_ID_PREFIX_RE.fullmatch(sid))
+    if prefix:
+        unique = _prefix_hits(sid)
     if not unique:
         roots = f"{CLAUDE_PROJECTS_DIR} or {CODEX_HOME / 'sessions'}"
-        sys.exit(f"session '{sid}' not found under {roots}")
+        hint = (" (a short id needs at least 8 characters)"
+                if re.fullmatch(r"[0-9a-f-]{1,7}", sid, re.I) else "")
+        sys.exit(f"session '{sid}' not found under {roots}{hint}")
     if len(unique) > 1:
-        matches = "\n".join(f"  {provider}: {path}" for path, provider in unique)
-        sys.exit(f"session id '{sid}' is ambiguous:\n{matches}")
+        matches = "\n".join(f"  {provider}: {_stored_id(path)}  {path}"
+                            for path, provider in unique)
+        what = "id prefix" if prefix else "id"
+        sys.exit(f"session {what} '{sid}' is ambiguous:\n{matches}")
     return unique[0]
 
 
@@ -367,6 +407,14 @@ def _lines_backwards(stream, step: int = 1 << 16):
         lines = (chunk + b"".join(reversed(later))).split(b"\n")
         later = [lines.pop(0)] if pos > 0 else []  # its start is further back
         yield from reversed(lines)
+
+
+def _local_time(moment: float, zone: bool = True) -> str:
+    """An epoch time as local `YYYY-MM-DD HH:MM` (plus the zone's name)."""
+    if moment == float("-inf"):
+        return "unknown"
+    local = datetime.datetime.fromtimestamp(moment).astimezone()
+    return local.strftime("%Y-%m-%d %H:%M %Z" if zone else "%Y-%m-%d %H:%M").strip()
 
 
 def last_activity(path: Path) -> float:
@@ -1490,7 +1538,7 @@ def build_transcript(records: list[dict], session_id: str, show_tools: bool,
 def build_combined(sessions: list[Session], show_tools: bool,
                    lineage: dict[str, list[str]] | None = None,
                    blurb: str = BLURB, messages: int | None = None,
-                   title: str | None = None) -> str:
+                   title: str | None = None, last_active: bool = False) -> str:
     """Stitch several sessions into one document, in the order given to it.
 
     Several ids are usually one conversation continued across sessions, so the
@@ -1509,6 +1557,10 @@ def build_combined(sessions: list[Session], show_tools: bool,
             "stamps": _timestamps(session.records),
             "turns": exchanges,
             "body": body,
+            # A recap names each session's day: say it in local time, as the
+            # listing does (the records' own stamps are UTC).
+            "active": f" · last active {_local_time(last_activity(session.path))}"
+                      if last_active else "",
         })
 
     total = len(parts)
@@ -1538,7 +1590,7 @@ def build_combined(sessions: list[Session], show_tools: bool,
                    if pid in position]
         resumed = f" · resumed from {', '.join(origins)}" if origins else ""
         out.append(f"{i}. `{p['id']}` — {_source_name(p['provider'])} · "
-                   f"{_turns(p['turns'])} · {_span(p['stamps'])}{resumed}")
+                   f"{_turns(p['turns'])} · {_span(p['stamps'])}{p['active']}{resumed}")
     out.append("")
 
     for i, p in enumerate(parts, 1):
@@ -1548,7 +1600,7 @@ def build_combined(sessions: list[Session], show_tools: bool,
             f"# Session {i} of {total} — `{p['id']}`",
             "",
             f"_Source: {_source_name(p['provider'])} · Project: `{p['cwd']}` · "
-            f"{_turns(p['turns'])} · {_span(p['stamps'])}_",
+            f"{_turns(p['turns'])} · {_span(p['stamps'])}{p['active']}_",
             "",
             p["body"],
         ]
@@ -1839,9 +1891,7 @@ def print_session_list() -> None:
     label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
     print(f"Sessions in {cwd} ({label}, newest first):\n")
     for path, provider, sid in shown:  # snippet read only for displayed sessions
-        moment = last_activity(path)  # the time the listing is sorted by
-        ts = (datetime.datetime.fromtimestamp(moment).strftime("%Y-%m-%d %H:%M")
-              if moment != float("-inf") else "unknown")
+        ts = _local_time(last_activity(path), zone=False)  # what it's sorted by
         snippet = first_user_snippet(path, provider)
         print(f"  {provider:<6}  {sid}  {ts}" + (f"  {snippet}" if snippet else ""))
     print("\nRe-run with one:  session-transcript <sessionId>")
@@ -1914,7 +1964,8 @@ def main() -> None:
             "                                           in ONE file\n\n"
             "Sessions are scoped to the current directory. Lookup by id "
             "searches the\nClaude Code and Codex stores; the matching store "
-            "selects the provider.\n\n"
+            "selects the provider.\nA unique prefix of 8+ characters (the short "
+            "id a recap shows) works too.\n\n"
             "Several ids are stitched into a single transcript, in the order "
             "given,\neach session under its own heading. --deep adds the "
             "sessions they were\nresumed from, transitively, oldest first: "
@@ -2054,7 +2105,7 @@ def main() -> None:
 
     if recent:
         transcript = build_combined(sessions, args.tools, None, blurb,
-                                    args.messages, title)
+                                    args.messages, title, last_active=True)
         default_out = combined_out_path([s.id for s in sessions], "recent", suffix)
     elif len(sessions) == 1:
         only = sessions[0]
