@@ -719,7 +719,7 @@ class ClaudeHarnessTests(unittest.TestCase):
             claude_user("<bash-input>git status</bash-input><bash-stdout>clean"
                         "</bash-stdout><bash-stderr></bash-stderr>"),
             queued("ss: and check the README too"),  # typed while Claude worked
-            queued("already a user record"), claude_user("already a user record"),
+            claude_user("gcm!"), queued("gcm!"),  # the same command, typed again
             claude_user([{"type": "text", "text": REMINDER},
                          {"type": "text", "text": "two blocks, one typed"}]),
         ]
@@ -727,9 +727,29 @@ class ClaudeHarnessTests(unittest.TestCase):
             ("user", "what does this mean"),
             ("user", "!git status"),
             ("user", "ss: and check the README too"),
-            ("user", "already a user record"),
+            ("user", "gcm!"),
+            ("user", "gcm!"),
             ("user", "two blocks, one typed"),
         ])
+
+    def test_queued_prompts_without_an_origin(self):
+        # Older Claude Code files no origin: tell a notice by its shape.
+        def bare(prompt):
+            record = queued(prompt)
+            del record["attachment"]["origin"]
+            return record
+        self.assertEqual(self.turns([bare("typed mid-turn"), bare(NOTICE),
+                                     bare('<agent-message from="a1">\nhi\n</agent-message>')]),
+                         [("user", "typed mid-turn")])
+
+    def test_snippet_from_a_queued_first_prompt(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "s.jsonl"
+            records = [queued(NOTICE, kind="task-notification", mode="task-notification"),
+                       queued("first thing I typed"), claude_user("second")]
+            path.write_text("\n".join(map(json.dumps, records)), encoding="utf-8")
+            self.assertEqual(TRANSCRIPT["first_user_snippet"](path, "claude"),
+                             "first thing I typed")
 
     def test_the_same_tags_typed_by_the_user_are_kept(self):
         for text in ("what does <system-reminder> do?",

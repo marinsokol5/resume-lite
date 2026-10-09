@@ -322,6 +322,9 @@ def first_user_snippet(path: Path, provider: str, limit: int = 72,
                 r = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            queued = queued_prompt(r) if provider == "claude" else None
+            if queued:  # the first prompt was typed while Claude worked
+                return _short(queued, limit)
             if provider == "claude" and r.get("type") == "user" \
                     and not r.get("isSidechain") and not r.get("isMeta") \
                     and not _harness_origin(r) and isinstance(r.get("message"), dict):
@@ -530,14 +533,14 @@ def queued_prompt(record: dict) -> str | None:
             or attachment.get("type") != "queued_command" \
             or attachment.get("commandMode") != "prompt":
         return None
-    origin = attachment.get("origin")
-    if not isinstance(origin, dict) or origin.get("kind") != "human":
-        return None  # a task notice, or a message from another session
-    return user_text({"content": attachment.get("prompt")})
-
-
-def _flat(text: str) -> str:
-    return " ".join(text.split())
+    origin, prompt = attachment.get("origin"), attachment.get("prompt")
+    if isinstance(origin, dict):
+        if origin.get("kind") != "human":
+            return None  # a task notice, or a message from another session
+    elif isinstance(prompt, str) and prompt.lstrip().startswith(
+            ("<task-notification>", "<agent-message")):
+        return None  # older Claude Code files no origin: tell by the shape
+    return user_text({"content": prompt})
 
 
 def _short(s: str, n: int = 48) -> str:
@@ -1182,16 +1185,11 @@ def _codex_answers(output) -> str | None:
 def normalized_events(records: list[dict], provider: str):
     """Yield (user|assistant|plan|tool, text) events from either provider."""
     if provider == "claude":
-        # A queued prompt that also became a user record is shown once.
-        typed = {_flat(text) for r in records
-                 if r.get("type") == "user" and isinstance(r.get("message"), dict)
-                 and not (r.get("isSidechain") or r.get("isMeta"))
-                 for text in [user_text(r["message"])] if text}
         for r in records:
             if r.get("isSidechain") or r.get("isMeta") or _harness_origin(r):
                 continue
-            queued = queued_prompt(r)
-            if queued and _flat(queued) not in typed:
+            queued = queued_prompt(r)  # never also filed as a user record
+            if queued:
                 yield "user", queued
                 continue
             typ, msg = r.get("type"), r.get("message")
