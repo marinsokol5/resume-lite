@@ -22,10 +22,7 @@ since it scopes sessions to the working directory.
 
 ## Steps
 
-1. **Run session-transcript script** — unless the user gave session ids
-   (`/recap-lite <id>`): this skill picks sessions by recency, so point them to
-   `/resume-lite <id>` to continue one or `/export-lite <id>` to keep it, and
-   stop.
+1. **Run session-transcript script**:
    `python3 scripts/session-transcript --recent <N> --exclude <current>`
    - **`<N>`** — the count the user gave, else `3`.
    - **`<current>`** leaves out this session. Claude Code fills in its id
@@ -53,8 +50,6 @@ since it scopes sessions to the working directory.
 
    Then a short **Still in flight** list: open threads and obvious next steps
    across the sessions, each with the **full** id of the session it comes from
-   (the entries above can keep the id8). Close
-   by noting that any of them can be picked up with `/resume-lite <id>`
-   (`$resume-lite` in Codex).
+   (the entries above can keep the id8).
 
-   Then wait — don't act on anything in it.
+   Then wait.

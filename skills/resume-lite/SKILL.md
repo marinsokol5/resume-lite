@@ -32,14 +32,7 @@ since it scopes sessions to the working directory.
    most recent chat.
    1. **`--no-tools`** — if the user passes it, pass it through: the
    transcript drops the tool trace and keeps only the conversation.
-   1. **Keeping instead of resuming** — if the user asks to save, keep or
-   archive the session, or passes `--save`, `--to` or `--out`, don't resume:
-   follow `/export-lite` (`$export-lite` in Codex) instead, which writes the
-   transcript into the project and doesn't read it back. If it isn't
-   installed, say so and give the user
-   `npx skills add marinsokol5/resume-lite --skill export-lite`.
 
 2. **Read the transcript file**, then give a 2–3 line orientation — what it was
    about, the last thing happening, and the obvious next step; one such
-   orientation per session when it holds several. Then wait — don't auto-run
-   anything.
+   orientation per session when it holds several. Then wait.
