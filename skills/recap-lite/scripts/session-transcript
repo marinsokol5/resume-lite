@@ -1749,27 +1749,20 @@ def _slugify(text: str, limit: int = 48) -> str:
     return slug[:limit].rsplit("-", 1)[0] or slug[:limit]  # don't end mid-word
 
 
-def _local_date(stamp: str) -> str:
-    try:
-        return (datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-                .astimezone().strftime("%Y-%m-%d"))
-    except ValueError:
-        return stamp[:10]
-
-
 def save_out_path(sessions: list[Session], directory: Path | str = SAVE_DIR,
                   topic: str | None = None) -> Path:
     """In-project path for a transcript worth keeping (and committing).
 
-    Named for a human scanning a repo listing, not for a machine: the date and
-    the opening prompt of the first session are what you recognize it by
-    months later — or the topic the user gave, which names it better. Two
-    exports can share a name; claim_name settles it.
+    Named for a human scanning a repo listing, not for a machine: the date the
+    work last moved (the latest activity across the sessions) and the opening
+    prompt of the first session are what you recognize it by months later —
+    or the topic the user gave, which names it better. Two exports can share
+    a name; claim_name settles it.
     """
     session = sessions[0]
-    stamps = _timestamps(session.records)
-    date = (_local_date(stamps[0]) if stamps else
-            datetime.date.fromtimestamp(session.path.stat().st_mtime).isoformat())
+    latest = max(last_activity(s.path) for s in sessions)
+    date = (datetime.date.fromtimestamp(latest) if latest != float("-inf")
+            else datetime.date.today()).isoformat()
     slug = _slugify(topic or "")
     if topic and not slug:
         print(f"--topic {topic!r}: no letters or digits a file name can keep; "

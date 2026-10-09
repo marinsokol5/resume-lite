@@ -63,5 +63,4 @@ since it scopes sessions to the working directory.
 4. **Report the path and stop**, saying which topic you chose if the user
    didn't give one. Where it applies, tell them that exporting the same
    session(s) again overwrites that file, while a different session that gets
-   the same name is saved as `-2`, `-3`, …; and that with `--deep` the date
-   comes from the oldest session in the chain.
+   the same name is saved as `-2`, `-3`, ….

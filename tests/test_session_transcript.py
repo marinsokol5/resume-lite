@@ -359,6 +359,19 @@ class OutputTests(unittest.TestCase):
                          self.root / "exact.md")
         self.assert_rejected(paths[0], "--topic", "x", message="--topic names a kept")
 
+    def test_save_name_dates_the_last_activity(self):
+        ids = [f"f{i:07x}-2222-4222-8222-{i:012x}" for i in range(1, 3)]
+        older = self.write_session(ids[0], 2, "Old work")
+        later = self.write_session(ids[1], 3, "Long work")
+        with later.open("a", encoding="utf-8") as stream:  # still going on the 7th
+            stream.write("\n" + json.dumps({"type": "event_msg",
+                                            "timestamp": "2026-09-07T12:00:00Z",
+                                            "payload": {"type": "agent_message",
+                                                        "message": "done"}}))
+        self.assertEqual(self.invoke(later, "--save").name, "2026-09-07-long-work.md")
+        # Several sessions: the latest activity across them, the first's topic.
+        self.assertEqual(self.invoke(older, later, "--save").name, "2026-09-07-old-work.md")
+
     def test_reexport_never_drops_what_the_file_holds(self):
         sid = "e1000001-2222-4222-8222-000000000001"
         path = self.write_session(sid, 9, "Ship it")

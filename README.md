@@ -107,10 +107,9 @@ reads the transcript back, so exporting costs the conversation next to nothing.
   other word is the topic. So `/export-lite fix README.md typos` names the
   file after the words: an existing file that isn't a transcript is never
   overwritten, even when given as the path.
-- **Naming.** The date the first session started, then the topic: your words
-  (they always win), else a short one the agent picks for the session you're
-  in, else another session's opening prompt. With `--deep` the date is the
-  oldest session's in the chain.
+- **Naming.** The date of the last activity (the latest across the sessions),
+  then the topic: your words (they always win), else a short one the agent
+  picks for the session you're in, else another session's opening prompt.
 - **Re-exporting** the same session(s) overwrites that same file — handy to
   refresh an export once the session has moved on. Anything else already under
   that name (a different session, another combination, a recap, a trimmed or
