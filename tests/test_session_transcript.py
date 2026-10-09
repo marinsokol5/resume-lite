@@ -632,6 +632,21 @@ class RecentTests(unittest.TestCase):
         _, text, _ = self.recap("--recent", 3)
         self.assertEqual(self.picked(text), [IDS[1], IDS[2], IDS[0]])
 
+    def test_listing_sorts_and_shows_last_activity(self):
+        bookkeeping = [{"type": "bridge-session", "sessionId": IDS[0]}]
+        self.add(IDS[0], "claude", 1, mtime=2_000_000_000, extra=bookkeeping)
+        self.add(IDS[1], "codex", 5, mtime=1_000_000_000)
+        self.add(IDS[2], "claude", 3, mtime=1_500_000_000)
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = [line.split() for line in result.stdout.splitlines()
+                if line.startswith("  ")]
+        self.assertEqual([row[1] for row in rows], [IDS[1], IDS[2], IDS[0]])
+        for row, day in zip(rows, (5, 3, 1)):  # each one's last message, local time
+            last = datetime.datetime(2026, 9, day, 12, 1, tzinfo=datetime.timezone.utc)
+            self.assertEqual(f"{row[2]} {row[3]}", datetime.datetime.fromtimestamp(
+                last.timestamp()).strftime("%Y-%m-%d %H:%M"))
+
     def test_provider_filter(self):
         self.add(IDS[0], "claude", 1)
         self.add(IDS[1], "codex", 2)

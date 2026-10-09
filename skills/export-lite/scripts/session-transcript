@@ -27,8 +27,9 @@ Usage:
         [--provider claude|codex] [--exclude <id>|this ...]  # in ONE file
 
 Sessions are scoped to the current directory. Pass no argument to list Claude
-Code and Codex sessions together (provider · id · time · first prompt); re-run
-with a chosen id. With an id, the storage location determines the provider.
+Code and Codex sessions together, newest first by last activity (provider · id
+· time of its last message · first prompt); re-run with a chosen id. With an
+id, the storage location determines the provider.
 
 Several ids are stitched into a single file, in the order given, each session
 under its own heading — one conversation continued across sessions stays one
@@ -303,7 +304,8 @@ def _same_directory(left: str, right: str) -> bool:
 
 
 def list_sessions() -> list[tuple[Path, str, str]]:
-    """This project's Claude and Codex sessions, newest first."""
+    """This project's Claude and Codex sessions, newest first by last activity
+    (see last_activity: a reopened old chat's mtime moves, its records don't)."""
     sessions: list[tuple[Path, str, str]] = []
     for f in glob.glob(str(claude_project_dir() / "*.jsonl")):
         path = Path(f)
@@ -314,7 +316,7 @@ def list_sessions() -> list[tuple[Path, str, str]]:
         if isinstance(cwd, str) and isinstance(sid, str) \
                 and _same_directory(cwd, os.getcwd()):
             sessions.append((path, "codex", sid))
-    sessions.sort(key=lambda item: item[0].stat().st_mtime, reverse=True)
+    sessions.sort(key=lambda item: last_activity(item[0]), reverse=True)
     return sessions
 
 
@@ -1633,8 +1635,8 @@ def recent_sessions(candidates: list[tuple[Path, str, str]], count: int,
                     ) -> tuple[list[Session], list[str], int]:
     """This project's `count` most recent sessions, newest first.
 
-    Recency is the last timestamped record (see last_activity), not mtime.
-    Passed over: excluded ids, sessions with no conversation at all, and
+    `candidates` comes from list_sessions, already newest first by last
+    activity. Passed over: excluded ids, sessions with no conversation at all, and
     sessions that only ran this skill family (see only_ran_this_family).
     Returns (sessions, excluded ids passed over on the way, family-only
     sessions passed over), counting only what came before the last pick.
@@ -1642,8 +1644,7 @@ def recent_sessions(candidates: list[tuple[Path, str, str]], count: int,
     picked: list[Session] = []
     excluded: list[str] = []
     summaries = 0
-    for path, session_provider, sid in sorted(
-            candidates, key=lambda item: last_activity(item[0]), reverse=True):
+    for path, session_provider, sid in candidates:
         if provider and session_provider != provider:
             continue
         if sid.lower() in exclude:
@@ -1672,7 +1673,9 @@ def print_session_list() -> None:
     label = f"latest {len(shown)} of {total}" if total > len(shown) else f"{total}"
     print(f"Sessions in {cwd} ({label}, newest first):\n")
     for path, provider, sid in shown:  # snippet read only for displayed sessions
-        ts = datetime.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        moment = last_activity(path)  # the time the listing is sorted by
+        ts = (datetime.datetime.fromtimestamp(moment).strftime("%Y-%m-%d %H:%M")
+              if moment != float("-inf") else "unknown")
         snippet = first_user_snippet(path, provider)
         print(f"  {provider:<6}  {sid}  {ts}" + (f"  {snippet}" if snippet else ""))
     print("\nRe-run with one:  session-transcript <sessionId>")
